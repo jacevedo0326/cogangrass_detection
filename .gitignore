@@ -1,0 +1,26 @@
+# Drone imagery & exports — far too large for git
+data/
+drone_dataset/
+*.zip
+*.JPG
+*.jpg
+
+# Model weights
+*.pt
+
+# Generated datasets & training artifacts (all regenerable from the scripts)
+tiles_dataset/
+runs/
+tile_labels/
+
+# Logs
+*.log
+
+# Visualizations / scratch
+data/_viz/
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
