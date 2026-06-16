@@ -7,13 +7,14 @@ Appends to the existing dataset, so you can add new fields incrementally.
 
 Run:  python prep_images.py <input_folder> [more_folders ...]
 """
+import os
 import sys
 import shutil
 from pathlib import Path
 
 from PIL import Image
 
-MAX = 1280
+MAX = int(os.environ.get("PREP_MAX", "1280"))   # set PREP_MAX=4096 for full resolution
 OUT_IMG = Path("drone_dataset/images")
 OUT_LBL = Path("drone_dataset/labels")
 

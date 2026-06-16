@@ -13,6 +13,7 @@ Outputs:
   tiles_dataset/not_cogongrass/*.jpg
 """
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -23,9 +24,9 @@ IMG_DIR = Path("drone_dataset/images")
 LBL_DIR = Path("drone_dataset/labels")
 OUT_LABELS = Path("tile_labels")
 OUT_TILES = Path("tiles_dataset")
-TILE = 160            # MUST match label_tiles.py
+TILE = int(os.environ.get("TILE_PX", "160"))   # 160 on 1280px frames; set TILE_PX=512 for full-res 4096px
 COVER_THRESH = 0.30   # tile = cogongrass if >= this fraction of it is inside a box
-CNN_SIZE = 224        # resize each exported tile to this
+CNN_SIZE = int(os.environ.get("TILE_SAVE_PX", "224"))   # on-disk tile size; set 512 to store full detail (model input resize happens in training)
 CUT_IMAGES = True     # also export the tile-image dataset
 VEG_THRESH = 0.03     # drop sky/non-vegetation tiles: skip tile if mean ExG < this
 

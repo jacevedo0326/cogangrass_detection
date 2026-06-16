@@ -1,0 +1,8 @@
+train frames 877 | test frames 109
+
+[1] sequence adjacency:
+  test frames with an adjacent (±1/±2 index) TRAIN frame: 0/107 (0%)  <- overlapping ground in both splits
+
+[2] visual nearest-TRAIN aHash distance for each TEST frame (0=identical):
+  median 6 | <=2 (near-identical): 30 | <=5: 52 | <=10: 80 of 109
+  (baseline: random unrelated frames usually differ by ~12-20 bits)

@@ -31,7 +31,8 @@ MAX_EPOCHS = 60
 PATIENCE = 8
 LR = 1e-4
 SEED = 42
-VAL_FRAC, TEST_FRAC = 0.15, 0.15
+VAL_FRAC, TEST_FRAC = 0.10, 0.10      # 80/10/10 train/val/test
+BALANCE_RATIO = 1.0                   # undersample majority class per split to this neg:pos ratio
 
 random.seed(SEED); torch.manual_seed(SEED)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -76,6 +77,20 @@ def grouped_split(samples, cog_idx):
     return idx(tr), idx(va), idx(te), (len(tr), len(va), len(te))
 
 
+def balance_split(idx, samples, cog_idx, ratio, rng):
+    """Undersample the majority class so each split is ~balanced (good class balance)."""
+    pos = [i for i in idx if samples[i][1] == cog_idx]
+    neg = [i for i in idx if samples[i][1] != cog_idx]
+    if pos and neg:
+        if len(neg) > ratio * len(pos):
+            neg = rng.sample(neg, int(ratio * len(pos)))
+        elif len(pos) > ratio * len(neg):
+            pos = rng.sample(pos, int(ratio * len(neg)))
+    out = pos + neg
+    rng.shuffle(out)
+    return out
+
+
 def run(model, loader, criterion, optimizer=None, scaler=None):
     train = optimizer is not None
     model.train() if train else model.eval()
@@ -83,7 +98,7 @@ def run(model, loader, criterion, optimizer=None, scaler=None):
     with torch.set_grad_enabled(train):
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device == "cuda")):
                 out = model(x); loss = criterion(out, y)
             if train:
                 optimizer.zero_grad(); scaler.scale(loss).backward()
@@ -101,11 +116,18 @@ def main():
 
     cog_idx = classes.index("cogongrass") if "cogongrass" in classes else 0
     tr_idx, va_idx, te_idx, (nf_tr, nf_va, nf_te) = grouped_split(base_eval.samples, cog_idx)
+    print(f"frames -> train {nf_tr} | val {nf_va} | test {nf_te}")
+    print(f"tiles (raw) -> train {len(tr_idx)} | val {len(va_idx)} | test {len(te_idx)}")
+
+    # balance each split to ~1:1 by undersampling the majority class
+    rng = random.Random(SEED)
+    tr_idx = balance_split(tr_idx, base_eval.samples, cog_idx, BALANCE_RATIO, rng)
+    va_idx = balance_split(va_idx, base_eval.samples, cog_idx, BALANCE_RATIO, rng)
+    te_idx = balance_split(te_idx, base_eval.samples, cog_idx, BALANCE_RATIO, rng)
     train_set = Subset(base_train, tr_idx)
     val_set = Subset(base_eval, va_idx)
     test_set = Subset(base_eval, te_idx)
-    print(f"frames -> train {nf_tr} | val {nf_va} | test {nf_te}")
-    print(f"tiles  -> train {len(tr_idx)} | val {len(va_idx)} | test {len(te_idx)}")
+    print(f"tiles (balanced) -> train {len(tr_idx)} | val {len(va_idx)} | test {len(te_idx)}")
 
     # class weights from the TRAIN split (counter the 88% imbalance)
     tr_labels = [base_eval.samples[i][1] for i in tr_idx]
@@ -113,9 +135,9 @@ def main():
     weights = torch.tensor(counts.sum() / (len(classes) * counts), dtype=torch.float, device=device)
     print("train class counts:", dict(zip(classes, counts.tolist())), "| loss weights:", weights.tolist())
 
-    train_loader = DataLoader(train_set, BATCH, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, BATCH, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_set, BATCH, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_set, BATCH, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_set, BATCH, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_set, BATCH, shuffle=False, num_workers=2, pin_memory=True)
 
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(model.fc.in_features, len(classes))
@@ -123,7 +145,7 @@ def main():
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.3, patience=3)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     best_bacc, best_state, since = 0.0, copy.deepcopy(model.state_dict()), 0
     for epoch in range(1, MAX_EPOCHS + 1):
@@ -133,6 +155,7 @@ def main():
         flag = ""
         if vb > best_bacc + 1e-4:
             best_bacc, best_state, since = vb, copy.deepcopy(model.state_dict()), 0; flag = "  <- best"
+            torch.save({"state_dict": best_state, "classes": classes}, "tile_classifier.pt")  # persist each best -> survives a crash
         else:
             since += 1
         print(f"epoch {epoch:2d}  train_loss {tl:.3f} bacc {tb:.3f} | val_loss {vl:.3f} bacc {vb:.3f}{flag}")
