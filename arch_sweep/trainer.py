@@ -64,6 +64,7 @@ class TrainConfig:
     ft_batch: int = 32
     ft_epochs: int = 8
     ft_patience: int = 3
+    augment: bool = False        # domain-randomization + MixStyle on the train path (U7)
 
     def identity(self) -> dict:
         return {k: getattr(self, k) for k in C.IDENTITY_FIELDS}
@@ -210,28 +211,43 @@ def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
     params = [p for p in model.parameters() if p.requires_grad] + list(head.parameters())
     n_trainable = sum(p.numel() for p in params)
 
-    ds = datasets.ImageFolder(FEAT._variant_dir(cfg.variant), transform=ext.preprocess)
+    variant_dir = FEAT._variant_dir(cfg.variant)
+    ds_eval = datasets.ImageFolder(variant_dir, transform=ext.preprocess)   # pure: no augmentation
+    mixstyle = None
+    if cfg.augment:                                # train-path only (0606); eval stays pure (U7)
+        import augment
+        ds_train = datasets.ImageFolder(variant_dir, transform=augment.domain_randomization())
+        mixstyle = augment.make_mixstyle().to(device)
+    else:
+        ds_train = ds_eval
     crit = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     opt = torch.optim.AdamW(params, lr=cfg.lr_finetune, weight_decay=cfg.weight_decay)
 
     def forward(x):
-        return head(ext.forward_features(x))
+        feats = ext.forward_features(x)
+        if mixstyle is not None:
+            feats = mixstyle(feats)               # no-op in eval mode (U7)
+        return head(feats)
 
     def predict(idx):
         model.eval(); head.eval()
+        if mixstyle is not None:
+            mixstyle.eval()
         ps = []
-        loader = DataLoader(Subset(ds, list(idx)), cfg.ft_batch, shuffle=False, num_workers=2)
+        loader = DataLoader(Subset(ds_eval, list(idx)), cfg.ft_batch, shuffle=False, num_workers=2)
         with torch.no_grad():
             for x, _ in loader:
                 ps.append(forward(x.to(device)).softmax(1)[:, cog_idx].float().cpu().numpy())
         return np.concatenate(ps) if ps else np.zeros(0)
 
-    y_val = [1 if int(ds.samples[i][1]) == cog_idx else 0 for i in va_idx]
-    tr_loader = DataLoader(Subset(ds, tr_bal), cfg.ft_batch, shuffle=True, num_workers=2)
+    y_val = [1 if int(ds_eval.samples[i][1]) == cog_idx else 0 for i in va_idx]
+    tr_loader = DataLoader(Subset(ds_train, tr_bal), cfg.ft_batch, shuffle=True, num_workers=2)
     best_bacc, best, since = -1.0, None, 0
     import copy
     for _epoch in range(cfg.ft_epochs):
         model.train(); head.train()
+        if mixstyle is not None:
+            mixstyle.train()
         for x, y in tr_loader:
             if x.size(0) < 2:
                 continue
@@ -319,6 +335,8 @@ def build_cli_parser(model: str | None, add_size: bool) -> argparse.ArgumentPars
                     choices=["frozen", "lora", "full"], help="tuning mode (lora/full -> U6)")
     ap.add_argument("--adaptation", default="none", help="test-time adaptation (-> U8)")
     ap.add_argument("--seed", type=int, default=C.DEFAULT_SEED)
+    ap.add_argument("--augment", action="store_true",
+                    help="domain-randomization + MixStyle on the train path (U7; lora/full)")
     ap.add_argument("--smoke", action="store_true",
                     help="fit gate: load the backbone + train/test on a tiny stratified subset; "
                          "writes under results/smoke (never the real results)")
@@ -334,14 +352,17 @@ def config_from_args(model: str | None, args) -> TrainConfig:
     """Turn parsed CLI args into a TrainConfig (resolving DINOv3 size to a backbone name)."""
     import backbones as B
 
-    extra = ""
+    parts = []
     resolved = model
     if getattr(args, "size", None) is not None:
         resolved = B.dinov3_name(args.size)
-        extra = f"size={args.size}"
+        parts.append(f"size={args.size}")
+    augment = getattr(args, "augment", False)
+    if augment:
+        parts.append("aug")        # in `extra` so an augmented cell gets a distinct job_id
     return TrainConfig(model=resolved, variant=args.variant, head=args.head,
                        tuning_mode=args.tuning_mode, adaptation=args.adaptation,
-                       seed=args.seed, extra=extra)
+                       seed=args.seed, extra=",".join(parts), augment=augment)
 
 
 SMOKE_DIR = C.RESULTS_DIR / "smoke"
