@@ -62,6 +62,23 @@ default cache fails). Backbones load **explicitly onto `cuda`** — never
 `device_map="auto"`, which CPU-offloads on the GB10 (~13× slowdown). **Stop other GPU
 tenants (the root vLLM servers) before a full sweep** so the ~120 GB is actually free.
 
+Backbone dependencies (beyond torch/torchvision/transformers), installed into the `.venv`
+and confirmed by the smoke fit gate: **`timm`** (PlantCLEF + AIMv2), **`torchmetrics`**
+(DINOv3 hub code), **`einops`** (C-RADIOv3 remote code). AIMv2 is loaded via `timm`
+(`aimv2_large_patch14_224.apple_pt`) because the transformers remote-code path is
+incompatible with transformers 5.x.
+
+Fit-gate every backbone before the full sweep (loads each model + trains/tests on a tiny
+subset, writes under `results/smoke/`):
+
+```bash
+export HF_HOME=/home/josh/hf_cache
+for s in resnet18 dinov2 plantclef siglip2 aimv2 cradio; do
+  .venv/bin/python arch_sweep/models/train_$s.py --smoke
+done
+for sz in s b l sat; do .venv/bin/python arch_sweep/models/train_dinov3.py --size $sz --smoke; done
+```
+
 Quick checks:
 
 ```bash
