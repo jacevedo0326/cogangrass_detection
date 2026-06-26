@@ -21,9 +21,10 @@ added in U6 and raise a clear error until then.
 """
 from __future__ import annotations
 
+import argparse
 import copy
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -199,3 +200,59 @@ def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
 def _is_oom(e: Exception) -> bool:
     msg = str(e).lower()
     return "out of memory" in msg or "cuda oom" in msg or type(e).__name__ == "OutOfMemoryError"
+
+
+def build_cli_parser(model: str | None, add_size: bool) -> argparse.ArgumentParser:
+    """Shared ablation-arg parser for the per-model scripts (U5). One source, no drift."""
+    import backbones as B
+
+    ap = argparse.ArgumentParser(description=f"Train + test {model or 'a model'} on 0606->0422")
+    ap.add_argument("--variant", default="reference", help="data variant (see data_variants.py)")
+    ap.add_argument("--head", default="mlp_bn", choices=H.HEAD_TYPES)
+    ap.add_argument("--mode", dest="tuning_mode", default="frozen",
+                    choices=["frozen", "lora", "full"], help="tuning mode (lora/full -> U6)")
+    ap.add_argument("--adaptation", default="none", help="test-time adaptation (-> U8)")
+    ap.add_argument("--seed", type=int, default=C.DEFAULT_SEED)
+    if add_size:
+        ap.add_argument("--size", default="l", choices=list(B.DINOV3_SIZES),
+                        help="DINOv3 backbone size")
+    return ap
+
+
+def config_from_args(model: str | None, args) -> TrainConfig:
+    """Turn parsed CLI args into a TrainConfig (resolving DINOv3 size to a backbone name)."""
+    import backbones as B
+
+    extra = ""
+    resolved = model
+    if getattr(args, "size", None) is not None:
+        resolved = B.dinov3_name(args.size)
+        extra = f"size={args.size}"
+    return TrainConfig(model=resolved, variant=args.variant, head=args.head,
+                       tuning_mode=args.tuning_mode, adaptation=args.adaptation,
+                       seed=args.seed, extra=extra)
+
+
+def run_cli(model: str | None = None, *, add_size: bool = False, argv=None) -> C.ResultRow:
+    """Entry point every per-model script calls: parse ablation args, train+eval, report.
+
+    The script supplies only the backbone name (and ``add_size`` for DINOv3). All split,
+    metric, threshold, and result-writing logic lives in ``common`` / ``trainer`` — the
+    script defines none of it (KTD1, enforced by tests/test_model_scripts.py).
+    """
+    args = build_cli_parser(model, add_size).parse_args(argv)
+    cfg = config_from_args(model, args)
+    print(f"== {cfg.model}  variant={cfg.variant} head={cfg.head} mode={cfg.tuning_mode} "
+          f"adaptation={cfg.adaptation} seed={cfg.seed} ==", flush=True)
+    row = train_and_eval(cfg)
+    if row.status == "ok":
+        print(f"\n0422 balanced accuracy: {row.balanced_accuracy:.3f}  "
+              f"(recall cog {row.recall_cogongrass:.3f} / not {row.recall_not_cogongrass:.3f})  "
+              f"AUROC {row.auroc if row.auroc is None else round(row.auroc, 3)}  "
+              f"op-threshold(0606) {row.threshold:.3f}")
+        for name, bacc in C.BASELINES:
+            print(f"  baseline {name}: {bacc:.3f}")
+    else:
+        print(f"\n[{row.status}] {row.error}")
+    print(f"wrote result -> {C.result_path(row)}")
+    return row
