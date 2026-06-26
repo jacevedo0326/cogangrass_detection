@@ -206,6 +206,45 @@ def _build_hub_dino(name, repo, entry, dim, img_size=224):
     return _build
 
 
+def _build_dinov3(name, hf_id, hub_entry, dim, img_size=224):
+    """DINOv3 loader with two license-compliant paths (weights are Meta-license-gated).
+
+    1. ``<NAME>_WEIGHTS=/path/x.pth`` -> load the architecture from the hub + your local
+       weights (fully offline).
+    2. otherwise -> the gated HF download (needs the accepted license + a token via
+       ``huggingface-cli login``).
+
+    Either way the model never auto-downloads ungated; a missing license fails loud with an
+    actionable message so the orchestrator records the cell and continues.
+    """
+    def _build(img_size=img_size):
+        import os
+
+        wpath = os.environ.get(f"{name.upper()}_WEIGHTS")
+        if wpath:
+            try:
+                import torch
+                m = torch.hub.load("facebookresearch/dinov3", hub_entry, weights=wpath,
+                                   trust_repo=True)
+                return TorchModuleExtractor(m, _eval_transform(img_size), feature_dim=dim)
+            except Exception as e:  # noqa: BLE001
+                raise BackboneLoadError(name, f"local weights {wpath!r}: {e}") from e
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+            proc = AutoImageProcessor.from_pretrained(hf_id)
+            model = AutoModel.from_pretrained(hf_id)
+            return HFExtractor(model, proc, feature_dim=dim)
+        except Exception as e:  # noqa: BLE001
+            m = str(e).lower()
+            if any(t in m for t in ("gated", "401", "403", "restricted", "awaiting", "forbidden")):
+                raise BackboneLoadError(name,
+                    f"{hf_id} is license-gated. Accept the license at "
+                    f"https://huggingface.co/{hf_id}, run `huggingface-cli login`, OR set "
+                    f"{name.upper()}_WEIGHTS=/path/to/{hub_entry}.pth. [{e}]") from e
+            raise BackboneLoadError(name, str(e)) from e
+    return _build
+
+
 def _build_timm(name, ref, dim, img_size=224):
     def _build(img_size=img_size):
         try:
@@ -257,17 +296,17 @@ register(BackboneSpec("dinov2", 384,
                       _build_hub_dino("dinov2", "facebookresearch/dinov2", "dinov2_vits14", 384),
                       "torch.hub", "dinov2_vits14"))
 register(BackboneSpec("dinov3_s", 384,
-                      _build_hub_dino("dinov3_s", "facebookresearch/dinov3", "dinov3_vits16", 384),
-                      "torch.hub", "dinov3_vits16"))
+                      _build_dinov3("dinov3_s", "facebook/dinov3-vits16-pretrain-lvd1689m",
+                                    "dinov3_vits16", 384), "hf", "dinov3-vits16-lvd1689m"))
 register(BackboneSpec("dinov3_b", 768,
-                      _build_hub_dino("dinov3_b", "facebookresearch/dinov3", "dinov3_vitb16", 768),
-                      "torch.hub", "dinov3_vitb16"))
+                      _build_dinov3("dinov3_b", "facebook/dinov3-vitb16-pretrain-lvd1689m",
+                                    "dinov3_vitb16", 768), "hf", "dinov3-vitb16-lvd1689m"))
 register(BackboneSpec("dinov3_l", 1024,
-                      _build_hub_dino("dinov3_l", "facebookresearch/dinov3", "dinov3_vitl16", 1024),
-                      "torch.hub", "dinov3_vitl16"))
+                      _build_dinov3("dinov3_l", "facebook/dinov3-vitl16-pretrain-lvd1689m",
+                                    "dinov3_vitl16", 1024), "hf", "dinov3-vitl16-lvd1689m"))
 register(BackboneSpec("dinov3_sat", 1024,
-                      _build_hub_dino("dinov3_sat", "facebookresearch/dinov3", "dinov3_vitl16_sat", 1024),
-                      "torch.hub", "dinov3_vitl16_sat"))
+                      _build_dinov3("dinov3_sat", "facebook/dinov3-vitl16-pretrain-sat493m",
+                                    "dinov3_vitl16", 1024), "hf", "dinov3-vitl16-sat493m"))
 register(BackboneSpec("plantclef", 768,
                       _build_timm("plantclef", "vit_base_patch14_reg4_dinov2.lvd142m", 768),
                       "timm", "vit_base_patch14_reg4_dinov2.lvd142m"))
