@@ -165,13 +165,22 @@ def _make_ok_row(cfg, *, p_val, y_val, p_te, y_te, val_bacc, n_train, n_val, n_t
 
 
 def _train_frozen(cfg, samples, features, labels, cog_idx, tr_bal, va_idx, te_idx):
-    """Frozen path: train a head on cached features. Returns (p_val, p_te, val_bacc, n_trainable)."""
+    """Frozen path: train a head on cached features, optionally adapt at test time (U8).
+
+    The operating threshold is fit on the 0606 val scores of the **source** head (before any
+    TTA); then, if ``cfg.adaptation`` names a TTA method, the head's BatchNorm is adapted to
+    the unlabeled 0422 features and the 0422 scores are taken from the adapted head.
+    Returns (p_val, p_te, val_bacc, n_trainable).
+    """
     import torch
     head, val_bacc, n_trainable = train_head(features, labels, tr_bal, va_idx, cog_idx, cfg)
     device = _device()
     X = torch.as_tensor(np.asarray(features), dtype=torch.float32)
-    return _probs(head, X, va_idx, cog_idx, device), _probs(head, X, te_idx, cog_idx, device), \
-        val_bacc, n_trainable
+    p_val = _probs(head, X, va_idx, cog_idx, device)            # source head -> honest threshold
+    if cfg.adaptation != "none":
+        import tta
+        tta.adapt_head(head, X[list(te_idx)].to(device), cfg.adaptation)   # label-free target adapt
+    return p_val, _probs(head, X, te_idx, cog_idx, device), val_bacc, n_trainable
 
 
 def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
