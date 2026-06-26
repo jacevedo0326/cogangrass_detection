@@ -1,0 +1,35 @@
+# arch_sweep job matrix — consumed by run_all.py (U11).
+#
+# Each entry under `jobs:` is expanded into cells; any list-valued key becomes a
+# cross-product (a grid). Every cell maps to one per-model script run and one
+# crash-safe results/<job_id>.jsonl. Re-running skips cells whose result exists
+# (resume). Defaults: variant=reference, head=mlp_bn, tuning_mode=frozen,
+# adaptation=none, seed=42.
+#
+# Stage 1 — the frozen-feature backbone tournament (the headline ranking).
+jobs:
+  - {model: resnet18}
+  - {model: dinov2}
+  - {model: plantclef}
+  - {model: siglip2}
+  - {model: aimv2}
+  - {model: cradio}
+  - {model: dinov3, size: s}
+  - {model: dinov3, size: b}
+  - {model: dinov3, size: l}
+  - {model: dinov3, size: sat}
+
+# Stage 2 — carry the frozen winners into the expensive arms. Uncomment as the
+# units land and the variants are materialized (data_variants.py):
+#
+#   # CLAHE data-variant ablation (needs `data_variants.py --build reference_clahe`)
+#   - {model: [siglip2, cradio, aimv2], variant: [reference, reference_clahe]}
+#
+#   # Test-time adaptation arm (U8): each emits an adapted + un-adapted pair
+#   - {model: [siglip2, cradio, aimv2], adaptation: [none, adabn, eata, rotta]}
+#
+#   # Tuning-mode arm (U6): fine-tune the top backbone
+#   - {model: siglip2, tuning_mode: [frozen, lora, full]}
+#
+#   # Continued-SSL adapted backbone (U9), scheduled like any other model
+#   - {model: dinov3_ssl}
