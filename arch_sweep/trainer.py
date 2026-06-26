@@ -213,6 +213,11 @@ def build_cli_parser(model: str | None, add_size: bool) -> argparse.ArgumentPars
                     choices=["frozen", "lora", "full"], help="tuning mode (lora/full -> U6)")
     ap.add_argument("--adaptation", default="none", help="test-time adaptation (-> U8)")
     ap.add_argument("--seed", type=int, default=C.DEFAULT_SEED)
+    ap.add_argument("--smoke", action="store_true",
+                    help="fit gate: load the backbone + train/test on a tiny stratified subset; "
+                         "writes under results/smoke (never the real results)")
+    ap.add_argument("--smoke-frames", type=int, default=10, help="frames/class/collection in --smoke")
+    ap.add_argument("--smoke-tiles", type=int, default=6, help="tiles/frame in --smoke")
     if add_size:
         ap.add_argument("--size", default="l", choices=list(B.DINOV3_SIZES),
                         help="DINOv3 backbone size")
@@ -233,6 +238,65 @@ def config_from_args(model: str | None, args) -> TrainConfig:
                        seed=args.seed, extra=extra)
 
 
+SMOKE_DIR = C.RESULTS_DIR / "smoke"
+SMOKE_FEAT = SMOKE_DIR / "features"
+
+
+def smoke_subset(samples, cog_idx, frames_per_class=10, tiles_per_frame=6,
+                 seed=C.DEFAULT_SEED) -> list[int]:
+    """Pick a tiny frame-grouped subset spanning both collections + both classes.
+
+    Frames (not tiles) are sampled so the 0606/0422 split stays leakage-free at smoke scale;
+    each chosen frame contributes a class-balanced handful of tiles. Enough 0606 frames are
+    kept that the 0606 val slice is non-empty, so the real train/threshold path is exercised.
+    """
+    import random
+
+    rng = random.Random(seed)
+    by_frame: dict[str, dict] = {}
+    for i, (p, lab) in enumerate(samples):
+        f = C.frame_of(p)
+        d = by_frame.setdefault(f, {"date": C.date_of(f), "tiles": [], "has_cog": False})
+        d["tiles"].append((i, lab))
+        if lab == cog_idx:
+            d["has_cog"] = True
+    chosen: list[int] = []
+    for date in (C.TRAIN_DATE, C.TEST_DATE):
+        frames = [f for f, d in by_frame.items() if d["date"] == date]
+        pos = [f for f in frames if by_frame[f]["has_cog"]]
+        neg = [f for f in frames if not by_frame[f]["has_cog"]]
+        rng.shuffle(pos)
+        rng.shuffle(neg)
+        for f in pos[:frames_per_class] + neg[:frames_per_class]:
+            tiles = by_frame[f]["tiles"]
+            cog = [i for i, lab in tiles if lab == cog_idx]
+            non = [i for i, lab in tiles if lab != cog_idx]
+            half = max(1, tiles_per_frame // 2)
+            take = (cog[:half] + non[:half]) or [i for i, _ in tiles[:tiles_per_frame]]
+            chosen.extend(take[:tiles_per_frame])
+    return chosen
+
+
+def run_smoke(cfg: TrainConfig, frames_per_class=10, tiles_per_frame=6) -> C.ResultRow:
+    """Fit gate for one cell: build the real backbone, extract a tiny subset, train+test.
+
+    Writes under ``results/smoke`` so a fit-gate pass never pollutes the real sweep results.
+    Returns the row (``status == "ok"`` means the whole real path works for this backbone).
+    """
+    import features as FEAT
+
+    data_dir = FEAT._variant_dir(cfg.variant)
+    samples, _classes, cog_idx = C.enumerate_tiles(data_dir)
+    sub_idx = smoke_subset(samples, cog_idx, frames_per_class, tiles_per_frame, cfg.seed)
+    sub = [samples[i] for i in sub_idx]
+    print(f"[smoke] {cfg.model}: extracting {len(sub)} tiles "
+          f"({sum(1 for _, l in sub if l == cog_idx)} cogongrass) ...", flush=True)
+    cache = FEAT.extract_and_cache(cfg.model, cfg.variant, samples=sub, overwrite=True,
+                                   batch_size=32, cache_dir=SMOKE_FEAT)
+    return train_and_eval(cfg, results_dir=SMOKE_DIR, samples=sub,
+                          features=cache["features"], labels=cache["labels"], cog_idx=cog_idx)
+
+
 def run_cli(model: str | None = None, *, add_size: bool = False, argv=None) -> C.ResultRow:
     """Entry point every per-model script calls: parse ablation args, train+eval, report.
 
@@ -242,9 +306,13 @@ def run_cli(model: str | None = None, *, add_size: bool = False, argv=None) -> C
     """
     args = build_cli_parser(model, add_size).parse_args(argv)
     cfg = config_from_args(model, args)
-    print(f"== {cfg.model}  variant={cfg.variant} head={cfg.head} mode={cfg.tuning_mode} "
-          f"adaptation={cfg.adaptation} seed={cfg.seed} ==", flush=True)
-    row = train_and_eval(cfg)
+    smoke = getattr(args, "smoke", False)
+    print(f"== {'[smoke] ' if smoke else ''}{cfg.model}  variant={cfg.variant} head={cfg.head} "
+          f"mode={cfg.tuning_mode} adaptation={cfg.adaptation} seed={cfg.seed} ==", flush=True)
+    if smoke:
+        row = run_smoke(cfg, args.smoke_frames, args.smoke_tiles)
+    else:
+        row = train_and_eval(cfg)
     if row.status == "ok":
         print(f"\n0422 balanced accuracy: {row.balanced_accuracy:.3f}  "
               f"(recall cog {row.recall_cogongrass:.3f} / not {row.recall_not_cogongrass:.3f})  "
@@ -254,5 +322,5 @@ def run_cli(model: str | None = None, *, add_size: bool = False, argv=None) -> C
             print(f"  baseline {name}: {bacc:.3f}")
     else:
         print(f"\n[{row.status}] {row.error}")
-    print(f"wrote result -> {C.result_path(row)}")
+    print(f"wrote result -> {C.result_path(row, SMOKE_DIR if smoke else C.RESULTS_DIR)}")
     return row
