@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Concurrent full cross-collection sweep over the fit-gated backbones (single-GPU).
+# Concurrent full cross-collection sweep over all 10 R2 backbones (single-GPU).
 # Each model runs as its own isolated process (failure-isolated: an OOM/crash in one
-# writes its own failed/oom row and never aborts the others). DINOv3 excluded (gated).
-# Real rows land in arch_sweep/results/<job_id>.jsonl the instant each finishes.
+# writes its own failed/oom row and never aborts the others). DINOv3 needs the HF token
+# (`hf auth login` once). Real rows land in arch_sweep/results/<job_id>.jsonl as each
+# finishes. NOTE: 10 backbones on one GPU will contend for VRAM — large ViTs (dinov3_l/sat,
+# aimv2, cradio) may OOM and self-record `oom`; the sequential run_working.sh is safer.
 cd /home/josh/dev/cogangrass_detection
 export HF_HOME=/home/josh/hf_cache
 PY=.venv/bin/python
@@ -23,11 +25,15 @@ one() {  # name  script-args...
   fi
 }
 
-one resnet18  train_resnet18.py &
-one dinov2    train_dinov2.py &
-one plantclef train_plantclef.py &
-one siglip2   train_siglip2.py &
-one aimv2     train_aimv2.py &
-one cradio    train_cradio.py &
+one resnet18   train_resnet18.py &
+one dinov2     train_dinov2.py &
+one plantclef  train_plantclef.py &
+one siglip2    train_siglip2.py &
+one aimv2      train_aimv2.py &
+one cradio     train_cradio.py &
+one dinov3_s   train_dinov3.py --size s &
+one dinov3_b   train_dinov3.py --size b &
+one dinov3_l   train_dinov3.py --size l &
+one dinov3_sat train_dinov3.py --size sat &
 wait
 echo "RUN_ALL_DONE" >> "$STATUS"

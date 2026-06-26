@@ -64,20 +64,36 @@ tenants (the root vLLM servers) before a full sweep** so the ~120 GB is actually
 
 Backbone dependencies (beyond torch/torchvision/transformers), installed into the `.venv`
 and confirmed by the smoke fit gate: **`timm`** (PlantCLEF + AIMv2), **`torchmetrics`**
-(DINOv3 hub code), **`einops`** (C-RADIOv3 remote code). AIMv2 is loaded via `timm`
-(`aimv2_large_patch14_224.apple_pt`) because the transformers remote-code path is
-incompatible with transformers 5.x.
+(DINOv3 hub code), **`einops`** + **`open_clip_torch`** (C-RADIOv3). AIMv2 is loaded via
+`timm` (`aimv2_large_patch14_224.apple_pt`) because the transformers remote-code path is
+incompatible with transformers 5.x; C-RADIOv3 loads via the `NVlabs/RADIO` hub for the
+same reason.
+
+**DINOv3 is license-gated.** Accept the license on each `facebook/dinov3-*` repo, then
+`hf auth login` once (token saved under `$HF_HOME`); the loader then downloads the gated
+weights. Alternatively set `DINOV3_<SIZE>_WEIGHTS=/path/to/x.pth` to load local weights
+offline. All 4 sizes (s/b/l/sat) are confirmed working with a token.
+
+Run the whole sweep once dependencies + the DINOv3 token are in place:
+
+```bash
+bash arch_sweep/run_working.sh              # all 10 backbones, sequential (safest)
+bash arch_sweep/run_working_concurrent.sh   # all 10 at once (faster start; VRAM-contended)
+```
 
 Fit-gate every backbone before the full sweep (loads each model + trains/tests on a tiny
 subset, writes under `results/smoke/`):
 
 ```bash
-export HF_HOME=/home/josh/hf_cache
+export HF_HOME=/home/josh/hf_cache    # needs `hf auth login` first for DINOv3
 for s in resnet18 dinov2 plantclef siglip2 aimv2 cradio; do
   .venv/bin/python arch_sweep/models/train_$s.py --smoke
 done
 for sz in s b l sat; do .venv/bin/python arch_sweep/models/train_dinov3.py --size $sz --smoke; done
 ```
+
+All 10 backbones pass this gate (resnet18, dinov2, dinov3 s/b/l/sat, plantclef, siglip2,
+aimv2, cradio).
 
 Quick checks:
 
