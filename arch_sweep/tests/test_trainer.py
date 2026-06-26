@@ -104,10 +104,12 @@ def test_determinism_same_cfg_same_balanced_accuracy(tmp_path):
     assert a.threshold == b.threshold
 
 
-# --- failure isolation: a bad cell records status, still writes a row ----------
-def test_non_frozen_mode_not_yet_supported(tmp_path):
+# --- failure isolation: an unloadable backbone records a row, never raises ----
+def test_failure_is_recorded_not_raised(tmp_path):
+    # a non-frozen cell on an unregistered backbone fails to build -> recorded, not raised
     samples, feats, labels = _synth()
-    row = T.train_and_eval(_cfg(tuning_mode="lora"), results_dir=tmp_path, samples=samples,
-                           features=feats, labels=labels, cog_idx=COG_IDX)
-    assert row.status == "failed" and "U6" in row.error
+    row = T.train_and_eval(_cfg(model="no-such-backbone", tuning_mode="full"),
+                           results_dir=tmp_path, samples=samples, features=feats,
+                           labels=labels, cog_idx=COG_IDX)
+    assert row.status in ("failed", "oom")
     assert list(tmp_path.glob("*.jsonl"))   # row still written (honest accounting)

@@ -31,6 +31,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import backbones as B  # noqa: E402
 import common as C  # noqa: E402
 import features as FEAT  # noqa: E402
 import heads as H  # noqa: E402
@@ -57,6 +58,12 @@ class TrainConfig:
     max_epochs: int = 60
     patience: int = 8
     batch_size: int = 256
+    # non-frozen (lora/full) image-path hyperparameters (U6)
+    lora_rank: int = 8
+    lr_finetune: float = 1e-4
+    ft_batch: int = 32
+    ft_epochs: int = 8
+    ft_patience: int = 3
 
     def identity(self) -> dict:
         return {k: getattr(self, k) for k in C.IDENTITY_FIELDS}
@@ -134,61 +141,151 @@ def _balanced_acc_on(head, X, y, idx, cog_idx, device):
     return C.balanced_accuracy(y_true, y_pred)
 
 
+def _make_ok_row(cfg, *, p_val, y_val, p_te, y_te, val_bacc, n_train, n_val, n_test,
+                 n_trainable, identity_overrides=None) -> C.ResultRow:
+    """Shared scoring tail: 0606-fit threshold + 0422 metrics -> an ok ResultRow.
+
+    Used by the frozen, fine-tune (U6), and TTA (U8) paths so every cell is scored
+    identically (KTD7). ``identity_overrides`` lets a TTA cell stamp e.g. adaptation=adabn.
+    """
+    threshold = C.pick_threshold_on(y_val, p_val) if len(set(y_val)) == 2 else 0.5
+    y_pred = [1 if pc >= 0.5 else 0 for pc in p_te]   # argmax — comparable to baselines
+    rec = C.per_class_recall(y_te, y_pred)
+    both = len(set(y_te)) == 2
+    identity = {**cfg.identity(), **(identity_overrides or {})}
+    return C.ResultRow(
+        **identity, status="ok",
+        balanced_accuracy=C.balanced_accuracy(y_te, y_pred),
+        recall_cogongrass=rec[C.COG_CLASS], recall_not_cogongrass=rec["not_cogongrass"],
+        auroc=C.auroc(y_te, p_te) if both else None,
+        average_precision=C.average_precision(y_te, p_te) if both else None,
+        threshold=threshold, val_balanced_accuracy=val_bacc, f2_sweep=C.f2_sweep(y_te, p_te),
+        n_train=n_train, n_val=n_val, n_test=n_test, n_cog_test=int(sum(y_te)),
+        trainable_params=n_trainable)
+
+
+def _train_frozen(cfg, samples, features, labels, cog_idx, tr_bal, va_idx, te_idx):
+    """Frozen path: train a head on cached features. Returns (p_val, p_te, val_bacc, n_trainable)."""
+    import torch
+    head, val_bacc, n_trainable = train_head(features, labels, tr_bal, va_idx, cog_idx, cfg)
+    device = _device()
+    X = torch.as_tensor(np.asarray(features), dtype=torch.float32)
+    return _probs(head, X, va_idx, cog_idx, device), _probs(head, X, te_idx, cog_idx, device), \
+        val_bacc, n_trainable
+
+
+def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
+    """Non-frozen path (U6): fine-tune the backbone (lora/full) end-to-end through the images.
+
+    Bypasses the feature cache (KTD2) — the backbone is updated — with a bounded batch for the
+    VRAM budget (KTD6). Records the trainable-param count. Returns (p_val, p_te, val_bacc, n).
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, Subset
+    from torchvision import datasets
+
+    C.set_global_seed(cfg.seed)
+    device = _device()
+    ext = B.get(cfg.model).build()
+    model = ext.model
+    if cfg.tuning_mode == "full":
+        for p in model.parameters():
+            p.requires_grad = True
+    elif cfg.tuning_mode == "lora":
+        B.inject_lora(model, rank=cfg.lora_rank)   # freezes base, adds low-rank adapters
+    else:
+        raise ValueError(f"_train_finetune got tuning_mode={cfg.tuning_mode!r}")
+    model.train()
+    head = H.build_head(cfg.head, ext.feature_dim, 2, dropout=cfg.dropout, hidden=cfg.hidden).to(device)
+    params = [p for p in model.parameters() if p.requires_grad] + list(head.parameters())
+    n_trainable = sum(p.numel() for p in params)
+
+    ds = datasets.ImageFolder(FEAT._variant_dir(cfg.variant), transform=ext.preprocess)
+    crit = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+    opt = torch.optim.AdamW(params, lr=cfg.lr_finetune, weight_decay=cfg.weight_decay)
+
+    def forward(x):
+        return head(ext.forward_features(x))
+
+    def predict(idx):
+        model.eval(); head.eval()
+        ps = []
+        loader = DataLoader(Subset(ds, list(idx)), cfg.ft_batch, shuffle=False, num_workers=2)
+        with torch.no_grad():
+            for x, _ in loader:
+                ps.append(forward(x.to(device)).softmax(1)[:, cog_idx].float().cpu().numpy())
+        return np.concatenate(ps) if ps else np.zeros(0)
+
+    y_val = [1 if int(ds.samples[i][1]) == cog_idx else 0 for i in va_idx]
+    tr_loader = DataLoader(Subset(ds, tr_bal), cfg.ft_batch, shuffle=True, num_workers=2)
+    best_bacc, best, since = -1.0, None, 0
+    import copy
+    for _epoch in range(cfg.ft_epochs):
+        model.train(); head.train()
+        for x, y in tr_loader:
+            if x.size(0) < 2:
+                continue
+            opt.zero_grad()
+            crit(forward(x.to(device)), y.to(device)).backward()
+            opt.step()
+        p_val = predict(va_idx)
+        vb = (C.balanced_accuracy(y_val, [1 if p >= 0.5 else 0 for p in p_val])
+              if len(set(y_val)) == 2 else 0.0)
+        if vb > best_bacc + 1e-4:
+            best_bacc, since = vb, 0
+            best = (copy.deepcopy(model.state_dict()), copy.deepcopy(head.state_dict()))
+        else:
+            since += 1
+            if since >= cfg.ft_patience:
+                break
+    if best is not None:
+        model.load_state_dict(best[0]); head.load_state_dict(best[1])
+    return predict(va_idx), predict(te_idx), float(max(best_bacc, 0.0)), n_trainable
+
+
 def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
                    features=None, labels=None, cog_idx=None) -> C.ResultRow:
-    """Train one cell on 0606 frozen features and evaluate on held-out 0422; write the row.
+    """Train one cell on 0606 and evaluate on held-out 0422; write the row.
 
-    ``samples`` / ``features`` / ``labels`` / ``cog_idx`` are injectable so the loop is
-    testable on a tiny synthetic feature set; in production they are loaded from the
-    per-(backbone, variant) feature cache (U3). Always writes a result row (even on failure)
-    so the orchestrator's coverage/failure accounting is honest (KTD8).
+    Dispatches on ``tuning_mode``: ``frozen`` trains a head on cached features (U4);
+    ``lora`` / ``full`` fine-tune the backbone through the images (U6). ``samples`` /
+    ``features`` / ``labels`` / ``cog_idx`` are injectable so the frozen loop is testable on a
+    tiny synthetic feature set. Always writes a result row (even on failure) so the
+    orchestrator's coverage accounting is honest (KTD8).
     """
     import torch  # noqa: F401 — ensures the ML stack is present before we start
 
     try:
-        if cfg.tuning_mode != "frozen":
-            raise NotImplementedError(
-                f"tuning_mode={cfg.tuning_mode!r} is added in U6; U4 implements frozen cells")
-        if features is None:
+        if features is None and cfg.tuning_mode == "frozen":
             data_dir = FEAT._variant_dir(cfg.variant)
-            samples, classes, cog_idx = C.enumerate_tiles(data_dir)
+            samples, _classes, cog_idx = C.enumerate_tiles(data_dir)
             cache = FEAT.extract_and_cache(cfg.model, cfg.variant, batch_size=64)
             features, labels = cache["features"], cache["labels"]
+        elif samples is None:
+            samples, _classes, cog_idx = C.enumerate_tiles(FEAT._variant_dir(cfg.variant))
         if cog_idx is None:
             cog_idx = 0
-        labels = np.asarray(labels)
+        if labels is not None:
+            labels = np.asarray(labels)
 
-        tr_idx, va_idx, te_idx, (nf_tr, nf_va, nf_te) = C.split_by_collection(samples, cog_idx, cfg.seed)
+        tr_idx, va_idx, te_idx, _ = C.split_by_collection(samples, cog_idx, cfg.seed)
         import random
-        rng = random.Random(cfg.seed)
-        tr_bal = C.balance(tr_idx, samples, cog_idx, rng)
+        tr_bal = C.balance(tr_idx, samples, cog_idx, random.Random(cfg.seed))
 
-        head, val_bacc, n_trainable = train_head(features, labels, tr_bal, va_idx, cog_idx, cfg)
+        if cfg.tuning_mode == "frozen":
+            p_val, p_te, val_bacc, n_trainable = _train_frozen(
+                cfg, samples, features, labels, cog_idx, tr_bal, va_idx, te_idx)
+            lab = labels
+        else:
+            p_val, p_te, val_bacc, n_trainable = _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx)
+            lab = np.asarray([s[1] for s in samples])
 
-        device = _device()
-        X = torch.as_tensor(np.asarray(features), dtype=torch.float32)
-        # operating threshold: fit on 0606 val scores ONLY (never the 0422 slice).
-        p_val = _probs(head, X, va_idx, cog_idx, device)
-        y_val = [1 if int(labels[i]) == cog_idx else 0 for i in va_idx]
-        threshold = C.pick_threshold_on(y_val, p_val) if len(set(y_val)) == 2 else 0.5
-
-        # evaluate on held-out 0422 (natural distribution).
-        p_te = _probs(head, X, te_idx, cog_idx, device)
-        y_te = [1 if int(labels[i]) == cog_idx else 0 for i in te_idx]
-        y_pred = [1 if pc >= 0.5 else 0 for pc in p_te]   # argmax — comparable to baselines
-        rec = C.per_class_recall(y_te, y_pred)
-        both = len(set(y_te)) == 2
-
-        row = C.ResultRow(
-            **cfg.identity(), status="ok",
-            balanced_accuracy=C.balanced_accuracy(y_te, y_pred),
-            recall_cogongrass=rec[C.COG_CLASS], recall_not_cogongrass=rec["not_cogongrass"],
-            auroc=C.auroc(y_te, p_te) if both else None,
-            average_precision=C.average_precision(y_te, p_te) if both else None,
-            threshold=threshold, val_balanced_accuracy=val_bacc,
-            f2_sweep=C.f2_sweep(y_te, p_te),
-            n_train=len(tr_bal), n_val=len(va_idx), n_test=len(te_idx),
-            n_cog_test=int(sum(y_te)), trainable_params=n_trainable)
+        y_val = [1 if int(lab[i]) == cog_idx else 0 for i in va_idx]
+        y_te = [1 if int(lab[i]) == cog_idx else 0 for i in te_idx]
+        row = _make_ok_row(cfg, p_val=p_val, y_val=y_val, p_te=p_te, y_te=y_te,
+                           val_bacc=val_bacc, n_train=len(tr_bal), n_val=len(va_idx),
+                           n_test=len(te_idx), n_trainable=n_trainable)
     except Exception as e:  # noqa: BLE001 — record the failure, never lose the cell (KTD8)
         status = "oom" if _is_oom(e) else "failed"
         row = C.ResultRow(**cfg.identity(), status=status, error=f"{type(e).__name__}: {e}"[:500])

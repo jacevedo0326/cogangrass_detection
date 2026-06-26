@@ -109,10 +109,14 @@ class TorchModuleExtractor(Extractor):
     def preprocess(self, img):
         return self.transform(img)
 
+    def forward_features(self, batch):
+        """Pooled features WITH grad (the fine-tune path, U6). ``embed`` is the no-grad cache form."""
+        return self.pool(self.model(batch.to(self.device)))
+
     def embed(self, batch) -> np.ndarray:
         torch = self.torch
         with torch.inference_mode():
-            out = self.pool(self.model(batch.to(self.device)))
+            out = self.forward_features(batch)
         return out.float().cpu().numpy()
 
 
@@ -132,21 +136,32 @@ class HFExtractor(Extractor):
             p.requires_grad = False
         self.processor = processor
         self.feature_dim = feature_dim
+        # cast inputs to the model's weight dtype (matters for bf16/fp16 models e.g. the 7B)
+        try:
+            self.in_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            self.in_dtype = torch.float32
 
     def preprocess(self, img):
         pv = self.processor(images=img, return_tensors="pt")["pixel_values"]
         return pv[0]
 
+    def forward_features(self, batch):
+        """Pooled features WITH grad (the fine-tune path, U6)."""
+        torch = self.torch
+        batch = batch.to(self.device).to(self.in_dtype)
+        feats = None
+        if hasattr(self.model, "get_image_features"):
+            feats = self.model.get_image_features(pixel_values=batch)
+        if feats is None or not torch.is_tensor(feats):
+            out = feats if feats is not None else self.model(pixel_values=batch)
+            feats = self._pool(out)
+        return feats
+
     def embed(self, batch) -> np.ndarray:
         torch = self.torch
-        batch = batch.to(self.device)
         with torch.inference_mode():
-            feats = None
-            if hasattr(self.model, "get_image_features"):
-                feats = self.model.get_image_features(pixel_values=batch)
-            if feats is None or not torch.is_tensor(feats):
-                out = feats if feats is not None else self.model(pixel_values=batch)
-                feats = self._pool(out)
+            feats = self.forward_features(batch)
         return feats.float().cpu().numpy()
 
     def _pool(self, out):
@@ -206,14 +221,15 @@ def _build_hub_dino(name, repo, entry, dim, img_size=224):
     return _build
 
 
-def _build_dinov3(name, hf_id, hub_entry, dim, img_size=224):
+def _build_dinov3(name, hf_id, hub_entry, dim, img_size=224, dtype=None):
     """DINOv3 loader with two license-compliant paths (weights are Meta-license-gated).
 
     1. ``<NAME>_WEIGHTS=/path/x.pth`` -> load the architecture from the hub + your local
        weights (fully offline).
     2. otherwise -> the gated HF download (needs the accepted license + a token via
-       ``huggingface-cli login``).
+       ``hf auth login``).
 
+    ``dtype`` (e.g. bf16) is passed to the HF load for the large 7B checkpoint so it fits.
     Either way the model never auto-downloads ungated; a missing license fails loud with an
     actionable message so the orchestrator records the cell and continues.
     """
@@ -230,9 +246,17 @@ def _build_dinov3(name, hf_id, hub_entry, dim, img_size=224):
             except Exception as e:  # noqa: BLE001
                 raise BackboneLoadError(name, f"local weights {wpath!r}: {e}") from e
         try:
+            import torch
             from transformers import AutoImageProcessor, AutoModel
             proc = AutoImageProcessor.from_pretrained(hf_id)
-            model = AutoModel.from_pretrained(hf_id)
+            td = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(dtype)
+            if td is not None:
+                try:
+                    model = AutoModel.from_pretrained(hf_id, dtype=td)         # transformers 5.x
+                except TypeError:
+                    model = AutoModel.from_pretrained(hf_id, torch_dtype=td)   # older arg name
+            else:
+                model = AutoModel.from_pretrained(hf_id)
             return HFExtractor(model, proc, feature_dim=dim)
         except Exception as e:  # noqa: BLE001
             m = str(e).lower()
@@ -307,6 +331,12 @@ register(BackboneSpec("dinov3_l", 1024,
 register(BackboneSpec("dinov3_sat", 1024,
                       _build_dinov3("dinov3_sat", "facebook/dinov3-vitl16-pretrain-sat493m",
                                     "dinov3_vitl16", 1024), "hf", "dinov3-vitl16-sat493m"))
+# The max-performance aerial checkpoint: 6.7B-param satellite ViT-7B (domain-matched, top
+# GEO-Bench). Loaded in bf16 to fit the GB10. feature_dim 4096.
+register(BackboneSpec("dinov3_sat7b", 4096,
+                      _build_dinov3("dinov3_sat7b", "facebook/dinov3-vit7b16-pretrain-sat493m",
+                                    "dinov3_vit7b16", 4096, dtype="bf16"),
+                      "hf", "dinov3-vit7b16-sat493m"))
 register(BackboneSpec("plantclef", 768,
                       _build_timm("plantclef", "vit_base_patch14_reg4_dinov2.lvd142m", 768),
                       "timm", "vit_base_patch14_reg4_dinov2.lvd142m"))
@@ -319,10 +349,64 @@ register(BackboneSpec("aimv2", 1024,   # via timm: the transformers remote-code 
 register(BackboneSpec("cradio", 2304, _build_cradio, "torch.hub", "NVlabs/RADIO:c-radio_v3-b"))
 
 # DINOv3 size alias used by models/train_dinov3.py --size {s,b,l,sat}.
-DINOV3_SIZES = {"s": "dinov3_s", "b": "dinov3_b", "l": "dinov3_l", "sat": "dinov3_sat"}
+DINOV3_SIZES = {"s": "dinov3_s", "b": "dinov3_b", "l": "dinov3_l",
+                "sat": "dinov3_sat", "sat7b": "dinov3_sat7b"}
 
 
 def dinov3_name(size: str) -> str:
     if size not in DINOV3_SIZES:
         raise ValueError(f"dinov3 size must be one of {list(DINOV3_SIZES)}, got {size!r}")
     return DINOV3_SIZES[size]
+
+
+# ---------------------------------------------------------------------------
+# LoRA + tuning-mode helpers (U6) — wrap attention/projection Linears low-rank
+# ---------------------------------------------------------------------------
+def make_lora_linear(base, rank=8, alpha=16):
+    """A frozen ``nn.Linear`` + a trainable low-rank ``B @ A`` update (LoRA)."""
+    import torch
+    import torch.nn as nn
+
+    class LoRALinear(nn.Module):
+        def __init__(self, base, rank, alpha):
+            super().__init__()
+            self.base = base
+            for p in self.base.parameters():
+                p.requires_grad = False
+            self.A = nn.Parameter(torch.zeros(rank, base.in_features))
+            self.B = nn.Parameter(torch.zeros(base.out_features, rank))
+            nn.init.normal_(self.A, std=0.02)   # B stays zero -> adapter starts as identity
+            self.scale = alpha / rank
+
+        def forward(self, x):
+            return self.base(x) + (x @ self.A.t() @ self.B.t()) * self.scale
+
+    return LoRALinear(base, rank, alpha)
+
+
+# Linear sub-modules whose name hints attention / projection — where LoRA belongs on a ViT.
+LORA_NAME_HINTS = ("qkv", "q_proj", "k_proj", "v_proj", "out_proj", "proj", "attn", "fc1", "fc2")
+
+
+def inject_lora(model, rank=8, alpha=16, name_hints=LORA_NAME_HINTS) -> int:
+    """Replace matching ``nn.Linear`` modules in ``model`` with LoRA wrappers in-place.
+
+    Freezes the whole backbone first, then swaps in LoRA on attention/projection linears so
+    only the low-rank adapters (and the head, added by the trainer) carry gradients. Returns
+    the number of layers wrapped.
+    """
+    import torch.nn as nn
+
+    for p in model.parameters():
+        p.requires_grad = False
+    wrapped = 0
+    for parent_name, parent in list(model.named_modules()):
+        for child_name, child in list(parent.named_children()):
+            if isinstance(child, nn.Linear) and any(h in child_name.lower() for h in name_hints):
+                setattr(parent, child_name, make_lora_linear(child, rank, alpha))
+                wrapped += 1
+    return wrapped
+
+
+def count_trainable(module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
