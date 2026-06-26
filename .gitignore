@@ -10,8 +10,10 @@ drone_dataset/
 
 # Generated datasets & training artifacts (all regenerable from the scripts)
 tiles_dataset/
+tiles_dataset_*/
 runs/
 tile_labels/
+arch_sweep/results/
 
 # Logs
 *.log
@@ -24,3 +26,6 @@ data/_viz/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Local runtime (GB10 torch/transformers)
+.venv/

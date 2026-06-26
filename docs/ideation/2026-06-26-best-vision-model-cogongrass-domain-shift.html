@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation — Best vision model for cogongrass under cross-field domain shift</title>
+<style>
+  :root { --ink:#1a1a1a; --mut:#6b6b6b; --line:#e3e3e3; --win:#1b7a3d; --warn:#b4690e; --rej:#a32; --bg:#fafafa; }
+  body { font: 16px/1.6 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color:var(--ink);
+         max-width: 920px; margin: 2rem auto; padding: 0 1.2rem; background:#fff; }
+  h1 { font-size: 1.7rem; line-height:1.25; margin-bottom:.2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.2rem; border-bottom: 2px solid var(--line); padding-bottom:.3rem; }
+  h3 { font-size: 1.06rem; margin-bottom:.2rem; }
+  .meta { color: var(--mut); font-size:.9rem; margin-bottom: 1.4rem; }
+  .thesis { background:var(--bg); border-left:4px solid var(--win); padding: .8rem 1rem; border-radius:4px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding: .9rem 1.1rem; margin:.9rem 0; }
+  .rank { display:inline-block; min-width:1.6rem; height:1.6rem; line-height:1.6rem; text-align:center;
+          background:var(--win); color:#fff; border-radius:50%; font-weight:700; font-size:.85rem; margin-right:.4rem;}
+  .tag { font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; padding:.1rem .45rem; border-radius:3px; color:#fff; }
+  .t-backbone{background:#2456b8;} .t-method{background:#6b3fa0;} .t-reframe{background:#0f7a86;} .t-aux{background:#777;}
+  .lab { color:var(--mut); font-weight:600; font-size:.82rem; text-transform:uppercase; letter-spacing:.03em;}
+  table { border-collapse: collapse; width:100%; font-size:.92rem; margin:.6rem 0; }
+  th,td { border:1px solid var(--line); padding:.45rem .6rem; text-align:left; vertical-align:top; }
+  th { background:var(--bg); }
+  .rej td:first-child { color:var(--rej); font-weight:600; }
+  code { background:#f3f3f3; padding:.05rem .3rem; border-radius:3px; font-size:.88em; }
+  a { color:#2456b8; }
+  .small { font-size:.86rem; color:var(--mut); }
+</style>
+</head>
+<body>
+
+<h1>What is the very best vision model for cogongrass detection — given little data and cross-field domain shift, cost no object?</h1>
+<div class="meta">
+  Ideation · 2026-06-26 · repo-grounded (this codebase) ·
+  Subject: the strongest vision model/approach to generalize to a <em>new, unseen flight</em> from limited labels.<br>
+  Next step is <code>ce-brainstorm</code> on one direction — this doc ranks directions, it is not a plan.
+</div>
+
+<div class="thesis">
+<strong>Thesis (where all four research axes converge):</strong> the highest-leverage answer is <em>not</em> a bigger
+classifier, a satellite foundation model, or a zero-shot VLM. It is a <strong>frozen natural-image / plant
+self-supervised ViT (DINOv3 or PlantCLEF-DINOv2)</strong>, <strong>continued-pretrained on your own unlabeled drone
+frames</strong>, wrapped with a <strong>light, per-field-refreshable head</strong> and <strong>robust test-time
+adaptation</strong>. "Best model, cost no object" is really "best <em>system</em>" — the backbone swap is necessary
+but the domain-shift gap closes in the <em>self-supervised-on-your-own-imagery</em> and <em>adaptation</em> layers.
+The single biggest structural bet is <strong>factoring "where is grass-like vegetation" (robust) from "is this
+cogongrass" (the hard, shifting part)</strong> via SAM 3 / visual-exemplar prompting.
+</div>
+
+<h2>Top directions (survivors)</h2>
+
+<div class="card">
+  <h3><span class="rank">1</span> DINOv3 ViT-L (frozen) + BatchNorm head — the backbone swap
+     <span class="tag t-backbone">backbone</span></h3>
+  <div><span class="lab">Why it fits</span> Best dense/patch features of any open model; a <strong>Mar-2026 paper
+  "DINOv3 Meets YOLO26 for Weed Detection"</strong> is direct precedent for this exact task class, and DINOv2/v3
+  features are repeatedly shown to <em>hold accuracy under domain shift</em> (species F1 0.77 vs 0.24 for a CNN under
+  moderate shift). A frozen trunk is the intended, low-data-safe usage.</div>
+  <div><span class="lab">Integrate</span> <code>facebook/dinov3-vitl16</code> frozen → CLS + mean-pooled patch tokens →
+  2-layer MLP. Put a <strong>BatchNorm in the head</strong> so your existing AdaBN inference trick still applies (the
+  ViT has none). Drop-in replacement for <code>train_tiles_collection.py</code>'s ResNet18.</div>
+  <div><span class="lab">Tradeoffs</span> Bespoke "DINOv3 License" (commercial-OK but conditioned — legal should read
+  it). Start at ViT-L, not ViT-7B: with ~hundreds of labels, L wins per labeled example. The <strong>SAT-493M</strong>
+  variant is the closest overhead-trained sibling and worth an A/B.</div>
+  <div class="small">Sibling option: <strong>PlantCLEF-2024 DINOv2 (ViT-B/14 reg4)</strong> — DINOv2 fine-tuned on ~1.4M
+  ground-level RGB plant photos; the <em>best domain match</em> of any public weights and the PlantCLEF-winning
+  backbone. Benchmark it head-to-head with DINOv3.</div>
+</div>
+
+<div class="card">
+  <h3><span class="rank">2</span> Continued self-supervised pretraining on your unlabeled drone frames (ExPLoRA-style)
+     <span class="tag t-method">method · highest leverage</span></h3>
+  <div><span class="lab">Why it fits</span> This is the move that actually drags features into <em>your</em> imagery
+  manifold. <strong>ExPLoRA (2025)</strong> continues MAE/DINOv2 SSL on unlabeled target imagery (unfreeze 1–2 blocks +
+  LoRA) and beats linear probing on aerial benchmarks at a fraction of full-finetune cost. You have the two ingredients
+  it needs in abundance: <strong>idle DGX compute</strong> and <strong>lots of unlabeled drone frames</strong>.</div>
+  <div><span class="lab">Integrate</span> One-time per imagery domain: run extra DINOv2/MAE epochs on <em>all</em> tiles
+  (labels not needed), keep most blocks frozen, then this becomes the backbone everything else wraps.</div>
+  <div><span class="lab">Tradeoffs</span> Highest compute of any option (hours–day) — but free here. Small unlabeled
+  corpora can overfit; the ExPLoRA discipline (freeze most blocks) guards against it.</div>
+</div>
+
+<div class="card">
+  <h3><span class="rank">3</span> SAM 3 (concept + visual-exemplar) → frozen-feature "is-it-cogongrass" head
+     <span class="tag t-reframe">structural reframe · highest upside</span></h3>
+  <div><span class="lab">Why it fits</span> <strong>SAM 3 (Meta, Nov 2025)</strong> does promptable <em>concept</em>
+  segmentation from a noun phrase, image exemplars, or both, returning masks for all matches at once. Factoring
+  <em>"where is grass-like vegetation"</em> (robust, generic) from <em>"which grass is it"</em> (your hard,
+  domain-shifting decision) is the single most promising structural change for cross-field robustness — and mask area
+  is a more honest coverage target than tile counts.</div>
+  <div><span class="lab">Integrate</span> SAM 3 proposes vegetation masks → a frozen DINOv3/PlantCLEF cosine or light
+  head classifies cogongrass vs other-grass on the masked crop. Keep the head's BatchNorm for AdaBN.</div>
+  <div><span class="lab">Tradeoffs</span> New, heavier pipeline; two models at inference (fine on the Spark). Validate it
+  beats the tile classifier on your 0606→0422 protocol before committing.</div>
+</div>
+
+<div class="card">
+  <h3><span class="rank">4</span> Few-shot adapter head + a tiny active-learning label budget per new field
+     <span class="tag t-method">method</span></h3>
+  <div><span class="lab">Why it fits</span> "Expense no concern" includes a <em>little human labeling</em>, and
+  <strong>20–50 smartly chosen tiles on the new field buys more than any unsupervised trick.</strong> On frozen
+  features, <strong>Tip-Adapter</strong> (training-free feature cache), prototype probes, or <strong>Soup-Adapters</strong>
+  (seed-averaged, robustness for free) are far more shift-robust than full fine-tune. Pick the tiles with
+  uncertainty × diversity (BADGE/coreset), never random.</div>
+  <div><span class="lab">Integrate</span> Per new field: active-select ~30 tiles → fit a prototype/Tip-Adapter head on
+  frozen features. LoRA-finetune only at ≥ a few hundred labels.</div>
+  <div><span class="lab">Tradeoffs</span> Needs a human in the loop per field — but the cheapest, most reliable path to
+  pushing past the 0.80–0.82 baseline.</div>
+</div>
+
+<div class="card">
+  <h3><span class="rank">5</span> Robust test-time adaptation — swap TENT → EATA / RoTTA
+     <span class="tag t-method">method · fixes a current risk</span></h3>
+  <div><span class="lab">Why it fits</span> Your current <strong>TENT/AdaBN is fragile exactly in your regime</strong>:
+  imbalanced (~88% positive), correlated, one-frame-at-a-time streams make plain TENT/CoTTA <em>collapse</em> (&gt;97%
+  error reported). <strong>RoTTA</strong> (robust BN + class-balanced memory + teacher–student) is purpose-built for
+  correlated/label-shifted streams; <strong>EATA</strong> adds reliable-sample selection with anti-forgetting.</div>
+  <div><span class="lab">Integrate</span> Keep BatchNorm in the head; replace TENT in <code>tta_eval.py</code> with EATA
+  or RoTTA, update only affine/adapter params, never the frozen backbone, with class-balanced memory + reliable-sample
+  filtering and per-frame reset caps.</div>
+</div>
+
+<div class="card">
+  <h3><span class="rank">6</span> Fourier amplitude-swap + MixStyle augmentation
+     <span class="tag t-method">method · cheap win</span></h3>
+  <div><span class="lab">Why it fits</span> Amplitude carries low-level <em>style</em> (illumination, soil/grass color),
+  phase carries semantics — swapping amplitude synthesizes "new-field" styles while preserving the grass structure. The
+  single best-matched augmentation to a cross-field illumination/color shift, ~zero extra cost, stacks on your existing
+  CLAHE + domain-randomization.</div>
+  <div><span class="lab">Tradeoffs</span> Can wash out the green-ness cue your ExG filter relies on — tune perturbation
+  strength.</div>
+</div>
+
+<div class="card">
+  <h3><span class="rank">7</span> Dark horses — C-RADIOv3 backbone &amp; T-Rex2/YOLOE exemplar detector
+     <span class="tag t-aux">alt framings</span></h3>
+  <div><strong>C-RADIOv3 (NVIDIA):</strong> one ViT distilled from DINOv3-7B + SigLIP2 + SAM3 teachers, explicitly
+  engineered for multi-domain robustness ("Reduce All Domains Into One") and DGX/ARM64-native. Pick it if the DINOv3
+  license is a blocker or you want robustness + semantics in one backbone.</div>
+  <div><strong>T-Rex2 / YOLOE (visual-exemplar one-shot detection):</strong> give 3–10 example crops of cogongrass per
+  new field as the only "labels"; strongest published evidence on custom-domain (Roboflow100/ODinW) generalization —
+  the closest proxy to "a new flight." Lower precision than your tuned classifier on the trained field; best as an
+  exemplar-prompted region proposer feeding your head.</div>
+</div>
+
+<h2>Rejected — and why (the value is in the explicit "no")</h2>
+<table>
+<thead><tr><th>Candidate</th><th>Why rejected for this problem</th></tr></thead>
+<tbody>
+<tr class="rej"><td>Satellite/EO foundation models (Prithvi-EO-2.0, Clay, SatMAE/Scale-MAE, DOFA, Galileo, AnySat)</td>
+  <td>Pretrained on <strong>nadir, multispectral</strong> satellite imagery; several bake top-down geometry or GSD
+  positional encodings into the architecture. Your data is <strong>oblique, RGB-only, single-frame</strong> — their
+  entire advantage (spectral bands, satellite GSD, temporal stacks) is unavailable. Honest verdict from the geospatial
+  scout: poor fit. (RGB <code>DINOv3-SAT</code> is the only EO-adjacent option worth a sanity A/B.)</td></tr>
+<tr class="rej"><td>Large VLM as the classifier (Qwen2.5-VL, InternVL, Gemini, GPT-4o)</td>
+  <td>2025–26 agronomy benchmarks: supervised YOLO/CNN <strong>substantially beats every zero-shot VLM</strong>; best
+  (Gemini-3 Pro) ~62% on multiple-choice, &lt;25% open-ended, with documented <em>reasoning-driven hallucination</em> and
+  poor calibration, and <em>no</em> cross-domain testing. <strong>This is exactly why the in-flight Qwen2-VL-7B run is a
+  capability read, not a deployment path.</strong> Keep VLMs for explanation + hard-negative mining only.</td></tr>
+<tr class="rej"><td>Text-only open-vocab detection ("cogongrass" → Grounding DINO)</td>
+  <td>Text prompts won't reliably localize a fine-grained species; generic "grass" cues dominate. Needs visual exemplars
+  (→ T-Rex2/YOLOE/SAM 3), not a label string.</td></tr>
+<tr class="rej"><td>Plain TENT / CoTTA at test time</td>
+  <td>Collapses under imbalanced, correlated, small-batch streams — your exact regime. Superseded by EATA/RoTTA.</td></tr>
+<tr class="rej"><td>EVA-02 · V-JEPA 2 · Hiera/MAE backbones</td>
+  <td>EVA's headline numbers are supervised-IN fine-tuning, not label-free transfer; V-JEPA is a video model (wrong tool
+  for static tiles); Hiera/MAE sit below DINOv2/v3 on frozen linear-probe transfer.</td></tr>
+</tbody>
+</table>
+
+<h2>If expense is truly no concern — the ceiling system</h2>
+<p>Stack the survivors rather than pick one: <strong>DINOv3-L (or PlantCLEF-DINOv2)</strong>, <strong>continued-SSL on
+your full unlabeled drone corpus</strong>, used inside a <strong>SAM 3 where/what factorization</strong>, with a
+<strong>few-shot adapter head refreshed per field from ~30 active-learning labels</strong>, <strong>EATA/RoTTA at
+inference</strong>, and <strong>Fourier/MixStyle augmentation at train time</strong>. Validate every layer against the
+existing 0606→0422 cross-collection protocol — that honest held-out number, not benchmark headlines, decides what beats
+the 0.80–0.82 baseline.</p>
+
+<h2>Grounding context</h2>
+<p class="small"><strong>Topic axes:</strong> general vision backbones · geospatial/plant foundation models ·
+domain-generalization &amp; test-time-adaptation methods · open-vocab detectors/segmenters &amp; VLMs.<br>
+<strong>Repo grounding:</strong> current ResNet18 tile classifier + DA track (CLAHE, domain-randomization, dropout/label
+smoothing), DINOv2 <code>_dino</code>/<code>_dino_spatial</code> experiments, TTA via <code>tta_eval.py</code>
+(AdaBN/TENT), the 0606→0422 cross-collection protocol, and the in-progress <code>vlm_zeroshot/</code> harness.</p>
+<p class="small"><strong>Key sources:</strong>
+DINOv3 (<a href="https://arxiv.org/abs/2508.10104">arXiv:2508.10104</a>, Aug 2025) ·
+"DINOv3 Meets YOLO26 for Weed Detection" (<a href="https://arxiv.org/html/2603.00160v1">arXiv:2603.00160</a>, Mar 2026) ·
+PlantCLEF-2024 DINOv2 (<a href="https://huggingface.co/vincent-espitalier/dino-v2-reg4-with-plantclef2024-weights">HF weights</a>) ·
+DINOv2 ag domain-shift (<a href="https://arxiv.org/html/2508.07514">arXiv:2508.07514</a>) ·
+ExPLoRA (<a href="https://arxiv.org/pdf/2406.10973">arXiv:2406.10973</a>, 2025) ·
+RoTTA/SAR (<a href="https://arxiv.org/abs/2303.13899">arXiv:2303.13899</a>) · EATA (<a href="https://arxiv.org/html/2403.11491v2">arXiv:2403.11491</a>) ·
+Tip-Adapter (<a href="https://www.ecva.net/papers/eccv_2022/papers_ECCV/papers/136950487.pdf">ECCV 2022</a>) · Soup-Adapters (<a href="https://arxiv.org/pdf/2507.05807">arXiv:2507.05807</a>) ·
+SAM 3 (<a href="https://arxiv.org/abs/2511.16719">arXiv:2511.16719</a>, Nov 2025) · T-Rex2 (<a href="https://arxiv.org/abs/2403.14610">arXiv:2403.14610</a>) · YOLOE (<a href="https://github.com/THU-MIG/yoloe">ICCV 2025</a>) ·
+"Are VLMs ready to replace supervised classification in agriculture?" (<a href="https://arxiv.org/html/2512.15977v2">arXiv:2512.15977</a>) ·
+C-RADIOv3 (<a href="https://huggingface.co/nvidia/C-RADIOv3-g">HF</a>) · AIMv2 (<a href="https://arxiv.org/pdf/2411.14402">arXiv:2411.14402</a>) · SigLIP 2 (<a href="https://arxiv.org/abs/2502.14786">arXiv:2502.14786</a>).</p>
+
+<h2>Next steps</h2>
+<ul>
+  <li><strong>Brainstorm one direction</strong> with <code>ce-brainstorm</code> — strongest candidate: "DINOv3/PlantCLEF
+  frozen backbone + continued-SSL on our unlabeled frames" (directions #1–#2), or the "SAM 3 where/what factorization" (#3).</li>
+  <li><strong>Quick empirical A/B</strong> first: swap ResNet18 → frozen DINOv3-L + BN head in a copy of
+  <code>train_tiles_collection.py</code> and read the 0606→0422 number — cheap, decisive, reuses your protocol.</li>
+  <li>Keep the <code>vlm_zeroshot/</code> result as the documented "zero-shot VLM is a floor, not a path" data point.</li>
+</ul>
+
+</body>
+</html>
