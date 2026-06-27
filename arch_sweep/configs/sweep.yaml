@@ -24,17 +24,31 @@ jobs:
   - {model: [siglip2, aimv2, cradio], adaptation: [adabn, eata, rotta]}
   - {model: dinov3, size: sat, adaptation: [adabn, eata, rotta]}
 
-# Stage 2 — carry the frozen winners into the expensive arms. Uncomment as the
-# units land and the variants are materialized (data_variants.py):
+  # Stage 2-finish — backbone-level cells from the finish plan (2026-06-27-002).
+  # All reuse cached features except dinov3_sat7b (extract first) and the lora cell.
+  #
+  # CORAL domain alignment (origin U6) on the frozen winners — label-free feature recolor.
+  - {model: [siglip2, aimv2, cradio, dinov3_sat], adaptation: coral}
+  #
+  # New TTA siblings (origin U10): SAR (sharpness-aware) + CoTTA (EMA teacher).
+  - {model: [siglip2, aimv2, cradio], adaptation: [sar, cotta]}
+  - {model: dinov3, size: sat, adaptation: [sar, cotta]}
+  #
+  # LoRA fine-tune + EATA compounded (origin U10 — the FT path now adapts).
+  - {model: aimv2, tuning_mode: lora, adaptation: eata}
+  #
+  # The un-run 7B satellite backbone (extract features first; see the finish runbook step 1).
+  - {model: dinov3, size: sat7b}
+  - {model: dinov3, size: sat7b, adaptation: [adabn, eata]}
+
+# Uncomment once its prerequisite is produced:
+#
+#   # Continued-SSL adapted backbone (origin U7) — needs the SSL checkpoint
+#   # (arch_sweep/continued_ssl.py --smoke then the real pretrain) before this resolves.
+#   - {model: dinov3_ssl}
 #
 #   # CLAHE data-variant ablation (needs `data_variants.py --build reference_clahe`)
 #   - {model: [siglip2, cradio, aimv2], variant: [reference, reference_clahe]}
 #
-#   # Test-time adaptation arm (U8): each emits an adapted + un-adapted pair
-#   - {model: [siglip2, cradio, aimv2], adaptation: [none, adabn, eata, rotta]}
-#
-#   # Tuning-mode arm (U6): fine-tune the top backbone
-#   - {model: siglip2, tuning_mode: [frozen, lora, full]}
-#
-#   # Continued-SSL adapted backbone (U9), scheduled like any other model
-#   - {model: dinov3_ssl}
+#   # Cleaned-label re-score (needs the SAM repair + human pass -> tiles_dataset_0422clean/)
+#   - {model: [siglip2, aimv2, cradio, dinov3_sat], variant: reference_0422clean}
