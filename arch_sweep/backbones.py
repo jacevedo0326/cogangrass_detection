@@ -373,8 +373,9 @@ def make_lora_linear(base, rank=8, alpha=16):
             self.base = base
             for p in self.base.parameters():
                 p.requires_grad = False
-            self.A = nn.Parameter(torch.zeros(rank, base.in_features))
-            self.B = nn.Parameter(torch.zeros(base.out_features, rank))
+            dev = base.weight.device          # create adapters on the base's device (GPU-safe)
+            self.A = nn.Parameter(torch.zeros(rank, base.in_features, device=dev))
+            self.B = nn.Parameter(torch.zeros(base.out_features, rank, device=dev))
             nn.init.normal_(self.A, std=0.02)   # B stays zero -> adapter starts as identity
             self.scale = alpha / rank
 

@@ -206,6 +206,7 @@ def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
         B.inject_lora(model, rank=cfg.lora_rank)   # freezes base, adds low-rank adapters
     else:
         raise ValueError(f"_train_finetune got tuning_mode={cfg.tuning_mode!r}")
+    model = model.to(device)        # ensure any newly-added params (LoRA) land on the GPU
     model.train()
     head = H.build_head(cfg.head, ext.feature_dim, 2, dropout=cfg.dropout, hidden=cfg.hidden).to(device)
     params = [p for p in model.parameters() if p.requires_grad] + list(head.parameters())

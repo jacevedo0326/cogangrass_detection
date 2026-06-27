@@ -40,6 +40,19 @@ def test_lora_param_count_much_smaller_than_full():
     assert lora < full * 0.5
 
 
+def test_lora_adapters_land_on_base_device():
+    # regression: LoRA params must be created on the base layer's device (GPU-safe), not CPU
+    import torch
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("no cuda")
+    base = torch.nn.Linear(8, 8).to("cuda")
+    lora = B.make_lora_linear(base, rank=4)
+    assert lora.A.device.type == "cuda" and lora.B.device.type == "cuda"
+    out = lora(torch.randn(2, 8, device="cuda"))   # forward must not raise a device mismatch
+    assert out.shape == (2, 8)
+
+
 def test_lora_adapter_starts_as_identity():
     import torch
     m = _tiny_vit()
