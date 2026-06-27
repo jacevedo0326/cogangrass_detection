@@ -182,20 +182,41 @@ def _make_ok_row(cfg, *, p_val, y_val, p_te, y_te, val_bacc, n_train, n_val, n_t
         trainable_params=n_trainable)
 
 
+def _coral_align(features, te_idx):
+    """Align all source (0606) rows to the 0422 target's second-order stats (U6; label-free).
+
+    Source rows are every row not in the 0422 ``te_idx``; they are CORAL-transformed toward the
+    target feature covariance/mean and written back, while the target rows are left untouched —
+    a head trained on the aligned source then predicts on the raw target. Uses no labels (KTD5).
+    """
+    feats = np.asarray(features, dtype=float).copy()
+    te = set(int(i) for i in te_idx)
+    src_rows = [i for i in range(len(feats)) if i not in te]
+    if not src_rows or not te:
+        return feats
+    feats[src_rows] = C.coral_transform(feats[src_rows], feats[list(te_idx)])
+    return feats
+
+
 def _train_frozen(cfg, samples, features, labels, cog_idx, tr_bal, va_idx, te_idx):
     """Frozen path: train a head on cached features, optionally adapt at test time (U8).
 
     The operating threshold is fit on the 0606 val scores of the **source** head (before any
     TTA); then, if ``cfg.adaptation`` names a TTA method, the head's BatchNorm is adapted to
     the unlabeled 0422 features and the 0422 scores are taken from the adapted head.
+    ``adaptation="coral"`` (U6) is a *training-time* feature alignment rather than a post-hoc BN
+    adapt: source features are CORAL-aligned to the target before the head is trained.
     Returns (p_val, p_te, val_bacc, n_trainable).
     """
     import torch
-    head, val_bacc, n_trainable = train_head(features, labels, tr_bal, va_idx, cog_idx, cfg)
+    feats = np.asarray(features, dtype=float)
+    if cfg.adaptation == "coral":
+        feats = _coral_align(feats, te_idx)            # align source to 0422 stats before training
+    head, val_bacc, n_trainable = train_head(feats, labels, tr_bal, va_idx, cog_idx, cfg)
     device = _device()
-    X = torch.as_tensor(np.asarray(features), dtype=torch.float32)
+    X = torch.as_tensor(np.asarray(feats), dtype=torch.float32)
     p_val = _probs(head, X, va_idx, cog_idx, device)            # source head -> honest threshold
-    if cfg.adaptation != "none":
+    if cfg.adaptation not in ("none", "coral"):
         import tta
         tta.adapt_head(head, X[list(te_idx)].to(device), cfg.adaptation)   # label-free target adapt
     return p_val, _probs(head, X, te_idx, cog_idx, device), val_bacc, n_trainable

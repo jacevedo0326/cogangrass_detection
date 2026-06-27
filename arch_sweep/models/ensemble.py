@@ -168,6 +168,55 @@ def run_ensemble(members=DEFAULT_MEMBERS, *, variant="reference", adaptation="no
     return row
 
 
+def fuse_features(feats_list):
+    """Early-fusion concat (U6): L2-normalize each backbone's block, then concatenate.
+
+    Per-block L2 normalization keeps a high-dim backbone from dominating the fused vector; the
+    fused width is the sum of the member dims — one BN head then learns over all of them.
+    """
+    blocks = []
+    for f in feats_list:
+        f = np.asarray(f, dtype=float)
+        norm = np.linalg.norm(f, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        blocks.append(f / norm)
+    return np.concatenate(blocks, axis=1)
+
+
+def run_concat(members=DEFAULT_MEMBERS, *, variant="reference", adaptation="none",
+               results_dir=C.RESULTS_DIR, caches=None, cog_idx=None, write_scores=False,
+               **cfg_kwargs) -> C.ResultRow:
+    """Early-fusion concat cell (U6): one BN head over the concatenated member features.
+
+    Distinct from ``run_ensemble`` (which averages *per-member head probs*) — here the features
+    are fused first and a single head learns the cross-backbone interaction. Scored through the
+    standard frozen trainer path so it is comparable and resume-safe; ``extra="concat=<members>"``.
+    """
+    cfg = T.TrainConfig(model="concat", variant=variant, adaptation=adaptation,
+                        extra="concat=" + "+".join(members), **cfg_kwargs)
+    try:
+        if caches is None:
+            import features as FEAT
+            caches = []
+            for b in members:
+                c = FEAT.load_features(b, variant)
+                if c is None:
+                    raise FileNotFoundError(f"no cached features for {b}×{variant} — extract first")
+                caches.append(c)
+        ref_paths, feats_list, labels = align_by_paths(caches)
+        fused = fuse_features(feats_list)
+        samples = list(zip(ref_paths, [int(x) for x in labels]))
+        if cog_idx is None:
+            cog_idx = C.CLASSES.index(C.COG_CLASS)
+        return T.train_and_eval(cfg, results_dir=results_dir, samples=samples, features=fused,
+                                labels=labels, cog_idx=cog_idx, write_scores=write_scores)
+    except Exception as e:  # noqa: BLE001 — record, never lose the cell (KTD8)
+        status = "oom" if T._is_oom(e) else "failed"
+        row = C.ResultRow(**cfg.identity(), status=status, error=f"{type(e).__name__}: {e}"[:500])
+        C.write_result_atomic(row, results_dir)
+        return row
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decorrelated backbone ensemble (U5)")
     ap.add_argument("--members", default=",".join(DEFAULT_MEMBERS),

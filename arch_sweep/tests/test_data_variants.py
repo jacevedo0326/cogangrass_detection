@@ -66,6 +66,28 @@ def test_label_area_threshold_changes_positive_count():
     assert sum(t["is_cog"] for t in loose) == 1
 
 
+# --- U6: multi-scale / flip TTA views -----------------------------------------
+def test_view_transforms_preserve_shape_and_label_geometry():
+    arr = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    for name, fn in DV.VIEW_TRANSFORMS.items():
+        out = fn(arr)
+        assert out.shape == arr.shape, f"{name} changed the tile shape"
+    # hflip is a real (non-identity) view and is its own inverse
+    flipped = DV.hflip_view(arr)
+    assert not np.array_equal(flipped, arr)
+    assert np.array_equal(DV.hflip_view(flipped), arr)
+
+
+def test_flip_view_averaging_preserves_shape():
+    import common as C2  # noqa
+    from models import ensemble as E
+    probs_identity = np.array([0.2, 0.8, 0.6])
+    probs_hflip = np.array([0.4, 0.7, 0.5])
+    averaged = E.average_probs([probs_identity, probs_hflip])
+    assert averaged.shape == probs_identity.shape
+    assert np.allclose(averaged, [0.3, 0.75, 0.55])
+
+
 # --- manifest correctness + idempotency ---------------------------------------
 def _make_variant_dir(root: Path, dir_name: str, n_cog: int, n_neg: int):
     for cls, n in (("cogongrass", n_cog), ("not_cogongrass", n_neg)):

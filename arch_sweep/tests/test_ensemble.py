@@ -107,6 +107,24 @@ def test_ensemble_eata_tier_runs(tmp_path):
     assert ens.status == "ok" and ens.adaptation == "eata"
 
 
+# --- U6: early-fusion concat --------------------------------------------------
+def test_fuse_features_dim_is_sum_of_member_dims():
+    a = np.ones((5, 4), dtype=np.float32)
+    b = np.ones((5, 7), dtype=np.float32)
+    fused = E.fuse_features([a, b])
+    assert fused.shape == (5, 11)                 # input dim = sum of member dims
+    assert np.allclose(np.linalg.norm(fused[:, :4], axis=1), 1.0)   # each block L2-normalized
+
+
+def test_concat_cell_trains_and_is_distinct(tmp_path):
+    samples = _samples()
+    c1, c2 = _cache(samples, 0), _cache(samples, 99)
+    row = E.run_concat(["m1", "m2"], caches=[c1, c2], cog_idx=COG_IDX,
+                       results_dir=tmp_path, **_cfg())
+    assert row.status == "ok" and row.model == "concat" and row.extra == "concat=m1+m2"
+    assert row.balanced_accuracy is not None and row.eval_setting == C.EVAL_CROSS
+
+
 def test_ensemble_writes_scores_sidecar(tmp_path):
     samples = _samples()
     c1, c2 = _cache(samples, 0), _cache(samples, 99)

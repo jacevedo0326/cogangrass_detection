@@ -145,6 +145,30 @@ def test_operating_threshold_is_independent_of_0422_labels(tmp_path):
     assert base.threshold == other.threshold
 
 
+# --- U6: CORAL domain alignment -----------------------------------------------
+def test_coral_aligns_source_covariance_to_target_no_labels():
+    rng = np.random.RandomState(0)
+    Xs = rng.randn(200, 8) @ np.diag([1, 2, 3, 4, 1, 1, 1, 1])      # source covariance
+    Xt = rng.randn(200, 8) @ np.diag([3, 1, 2, 1, 2, 1, 1, 1]) + 5  # different cov + mean shift
+    aligned = C.coral_transform(Xs, Xt)
+    before = np.linalg.norm(np.cov(Xs, rowvar=False) - np.cov(Xt, rowvar=False))
+    after = np.linalg.norm(np.cov(aligned, rowvar=False) - np.cov(Xt, rowvar=False))
+    assert after < before * 0.1                              # second-order stats now aligned
+    import inspect
+    assert list(inspect.signature(C.coral_transform).parameters)[:2] == ["Xs", "Xt"]  # no labels
+
+
+def test_coral_cell_runs_and_has_distinct_identity(tmp_path):
+    samples, feats, labels = _synth()
+    base = T.train_and_eval(_cfg(), results_dir=tmp_path, samples=samples,
+                            features=feats, labels=labels, cog_idx=COG_IDX)
+    coral = T.train_and_eval(_cfg(adaptation="coral"), results_dir=tmp_path, samples=samples,
+                             features=feats, labels=labels, cog_idx=COG_IDX)
+    assert coral.status == "ok" and coral.adaptation == "coral"
+    assert coral.job_id != base.job_id                       # distinct identity tag (KTD2)
+    assert coral.balanced_accuracy is not None
+
+
 # --- determinism: same cfg + seed -> same metric ------------------------------
 def test_determinism_same_cfg_same_balanced_accuracy(tmp_path):
     samples, feats, labels = _synth()

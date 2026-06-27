@@ -293,6 +293,32 @@ def apply_temperature(scores: Sequence[float], T: float) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-logit / float(T)))
 
 
+def _sym_sqrt(M: np.ndarray, *, inverse: bool = False, eps: float = 1e-12) -> np.ndarray:
+    """Symmetric (inverse) square root of a PSD matrix via eigendecomposition."""
+    w, V = np.linalg.eigh(M)
+    w = np.clip(w, eps, None)
+    s = 1.0 / np.sqrt(w) if inverse else np.sqrt(w)
+    return (V * s) @ V.T
+
+
+def coral_transform(Xs: np.ndarray, Xt: np.ndarray, *, eps: float = 1e-5) -> np.ndarray:
+    """Align SOURCE features' second-order stats to the TARGET (CORAL; label-free).
+
+    Whitens ``Xs`` by its own covariance, recolors to ``Xt``'s covariance, and shifts to the
+    target mean — so a head trained on the aligned source sees 0422-like statistics. Reads only
+    the two feature matrices, **never any labels** (KTD5). Returns the aligned source features.
+    """
+    Xs = np.asarray(Xs, dtype=float)
+    Xt = np.asarray(Xt, dtype=float)
+    d = Xs.shape[1]
+    ms, mt = Xs.mean(0), Xt.mean(0)
+    Cs = np.cov(Xs, rowvar=False) + eps * np.eye(d)
+    Ct = np.cov(Xt, rowvar=False) + eps * np.eye(d)
+    whiten = _sym_sqrt(Cs, inverse=True)   # Cs^{-1/2}
+    recolor = _sym_sqrt(Ct)                # Ct^{1/2}
+    return (Xs - ms) @ whiten @ recolor + mt
+
+
 def conformal_threshold(cal_scores: Sequence[float], cal_labels: Sequence[int],
                         target_fnr: float = 0.1) -> float:
     """Label-DEPENDENT threshold controlling the false-negative rate to ``<= target_fnr``.

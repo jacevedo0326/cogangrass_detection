@@ -90,6 +90,43 @@ def tile_records(arr: np.ndarray, mask: np.ndarray, tile_px: int,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Multi-scale / flip TTA views  (U6 — deterministic test-time views, averaged downstream)
+# ---------------------------------------------------------------------------
+# A "view" is a deterministic, label-preserving image transform applied at extract time; each
+# view yields its own cached features, and the per-tile head probs are averaged across views
+# (reuse ensemble.average_probs — a view is just a pseudo-member). Pure array transforms so the
+# shape-preservation invariant is unit-testable without the backbones.
+def hflip_view(arr: np.ndarray) -> np.ndarray:
+    """Horizontal flip (cogongrass texture is orientation-agnostic, so the label is preserved)."""
+    return np.ascontiguousarray(np.asarray(arr)[:, ::-1, :])
+
+
+def scale_view(arr: np.ndarray, factor: float = 0.9) -> np.ndarray:
+    """Center scale-and-crop/pad back to the original HxW (a multi-scale view), shape-preserving."""
+    from PIL import Image
+
+    a = np.asarray(arr)
+    H, W = a.shape[:2]
+    nh, nw = max(1, int(round(H * factor))), max(1, int(round(W * factor)))
+    resized = np.asarray(Image.fromarray(a).resize((nw, nh)))
+    out = np.zeros_like(a)
+    y0, x0 = (H - nh) // 2, (W - nw) // 2
+    if factor <= 1.0:                          # smaller view -> pad-center into the frame
+        out[y0:y0 + nh, x0:x0 + nw] = resized
+    else:                                      # larger view -> center-crop back to HxW
+        cy, cx = (nh - H) // 2, (nw - W) // 2
+        out = resized[cy:cy + H, cx:cx + W]
+    return np.ascontiguousarray(out)
+
+
+VIEW_TRANSFORMS = {
+    "identity": lambda a: np.ascontiguousarray(np.asarray(a)),
+    "hflip": hflip_view,
+    "scale90": lambda a: scale_view(a, 0.9),
+}
+
+
 def clahe(img):
     """CLAHE on the L channel (precompute_clahe.py:21-25). Lazy cv2 import (heavy dep)."""
     import cv2
