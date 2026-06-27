@@ -69,6 +69,62 @@ def test_eata_and_rotta_do_not_collapse_to_one_class():
         assert len(set(preds)) == 2, f"{method} collapsed to one class"
 
 
+# --- U10: SAR / CoTTA siblings, episodic per-frame, TTA on the fine-tuned path ---
+def test_sar_and_cotta_registered_and_touch_only_bn_affine():
+    import torch
+    assert "sar" in TTA.METHODS and "cotta" in TTA.METHODS
+    for method in ("sar", "cotta"):
+        head = H.build_head("mlp_bn", in_dim=8, hidden=8)
+        w0 = _linears(head)[0].weight.detach().clone()
+        feat = torch.randn(40, 8) * 2.0 + 1.0
+        TTA.adapt_head(head, feat, method, steps=3)
+        assert torch.allclose(_linears(head)[0].weight, w0), f"{method} moved Linear weights"
+        bn = TTA._bn_layers(head)[0]
+        assert bn.weight.requires_grad and bn.bias.requires_grad
+
+
+def test_sar_and_cotta_do_not_collapse_to_one_class():
+    import torch
+    for method in ("sar", "cotta"):
+        head, Xt = _trained_head_and_target(seed=2)
+        feat = torch.as_tensor(Xt).to(next(head.parameters()).device)
+        TTA.adapt_head(head, feat, method, steps=4)
+        head.eval()
+        with torch.no_grad():
+            preds = head(feat).argmax(1).tolist()
+        assert len(set(preds)) == 2, f"{method} collapsed to one class"
+
+
+def test_episodic_per_frame_does_not_collapse_on_imbalanced_stream():
+    import torch
+    head, _ = _trained_head_and_target(seed=3)
+    device = next(head.parameters()).device
+    base = {k: v.detach().clone() for k, v in head.state_dict().items()}
+    rng = np.random.RandomState(0)
+    # two single-class frames: one all-cogongrass (9 tiles), one all-not (3 tiles) — imbalanced
+    fa = np.full((9, 8), 2.0) + rng.randn(9, 8) * 0.1
+    fb = np.full((3, 8), -2.0) + rng.randn(3, 8) * 0.1
+    feat = torch.as_tensor(np.vstack([fa, fb]).astype(np.float32)).to(device)
+    frames = ["FA"] * 9 + ["FB"] * 3
+    probs = TTA.predict_episodic(head, feat, frames, COG, "eata", base_state=base, steps=4)
+    assert probs.shape == (12,)
+    assert probs[:9].mean() > 0.5 and probs[9:].mean() < 0.5   # frames not collapsed to one class
+    # episodic reset restores the head for reuse
+    assert torch.allclose(head.state_dict()["0.weight"], base["0.weight"])
+
+
+def test_lora_eata_combo_records_row_with_expected_identity(tmp_path):
+    # a lora+eata cell on an unregistered backbone fails to build -> recorded with the right
+    # identity (mode=lora, adaptation=eata); the fine-tuned path accepts the combo (U10).
+    samples, feats, labels = _synth()
+    row = T.train_and_eval(
+        T.TrainConfig(model="no-such-backbone", tuning_mode="lora", adaptation="eata"),
+        results_dir=tmp_path, samples=samples, features=feats, labels=labels, cog_idx=COG)
+    assert row.tuning_mode == "lora" and row.adaptation == "eata"
+    assert row.status in ("failed", "oom")
+    assert list(tmp_path.glob("*.jsonl"))
+
+
 def test_unknown_method_raises():
     import pytest
     head = H.build_head("mlp_bn", in_dim=4)

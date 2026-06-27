@@ -279,6 +279,21 @@ def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
                 ps.append(forward(x.to(device)).softmax(1)[:, cog_idx].float().cpu().numpy())
         return np.concatenate(ps) if ps else np.zeros(0)
 
+    def feats_for(idx):
+        """Pooled backbone features for ``idx`` (the head's input) — for TTA on the FT path (U10)."""
+        model.eval(); head.eval()
+        if mixstyle is not None:
+            mixstyle.eval()
+        fs = []
+        loader = DataLoader(Subset(ds_eval, list(idx)), cfg.ft_batch, shuffle=False, num_workers=2)
+        with torch.no_grad():
+            for x, _ in loader:
+                f = ext.forward_features(x.to(device))
+                if mixstyle is not None:
+                    f = mixstyle(f)
+                fs.append(f)
+        return torch.cat(fs, 0)
+
     y_val = [1 if int(ds_eval.samples[i][1]) == cog_idx else 0 for i in va_idx]
     tr_loader = DataLoader(Subset(ds_train, tr_bal), cfg.ft_batch, shuffle=True, num_workers=2)
     best_bacc, best, since = -1.0, None, 0
@@ -305,7 +320,17 @@ def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
                 break
     if best is not None:
         model.load_state_dict(best[0]); head.load_state_dict(best[1])
-    return predict(va_idx), predict(te_idx), float(max(best_bacc, 0.0)), n_trainable
+    p_val = predict(va_idx)                          # source scores -> honest threshold (pre-TTA)
+    if cfg.adaptation != "none":                     # U10: TTA compounds on the fine-tuned path
+        import tta
+        tf = feats_for(te_idx)                        # target features through the fine-tuned backbone
+        tta.adapt_head(head, tf, cfg.adaptation)      # adapt only the head BN (backbone frozen)
+        head.eval()
+        with torch.no_grad():
+            p_te = head(tf).softmax(1)[:, cog_idx].float().cpu().numpy()
+    else:
+        p_te = predict(te_idx)
+    return p_val, p_te, float(max(best_bacc, 0.0)), n_trainable
 
 
 def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
