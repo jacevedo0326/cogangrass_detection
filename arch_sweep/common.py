@@ -466,6 +466,102 @@ def read_scores(path: str | Path) -> list[ScoreRecord]:
 
 
 # ---------------------------------------------------------------------------
+# Frame-level bootstrap CIs + per-frame breakdown  (U2 — wins must be decidable)
+# ---------------------------------------------------------------------------
+# Tiles within a frame are correlated, so a tile-level bootstrap would understate the CI.
+# We resample **frames** with replacement (tiles of a frame always move together, mirroring
+# the frame-grouped 0606->0422 split) — the honest CI for "a new flight it has never seen".
+def frame_groups(frames: Sequence[str]) -> dict[str, list[int]]:
+    """Map each frame id to the tile indices belonging to it (preserves order)."""
+    groups: dict[str, list[int]] = {}
+    for i, f in enumerate(frames):
+        groups.setdefault(f, []).append(i)
+    return groups
+
+
+def bootstrap_ci(frames: Sequence[str], metric_fn, *, n_boot: int = 1000,
+                 alpha: float = 0.05, seed: int = DEFAULT_SEED) -> tuple[float, float, float]:
+    """Frame-resampled ``(lo, point, hi)`` CI for a tile-level metric.
+
+    ``metric_fn(tile_indices)`` computes the metric over the given tile indices and returns a
+    float, or ``None`` for a degenerate resample (e.g. one class absent) which is skipped. Each
+    bootstrap iteration resamples the **set of frames** with replacement and unions their tile
+    indices, so the no-leakage frame grouping is preserved inside the CI. ``point`` is the
+    metric on the full set; ``lo``/``hi`` are the ``alpha/2`` / ``1-alpha/2`` percentiles.
+    """
+    groups = frame_groups(frames)
+    frame_ids = list(groups)
+    point = metric_fn(list(range(len(frames))))
+    if not frame_ids:
+        return (point, point, point)
+    rng = random.Random(seed)
+    stats: list[float] = []
+    for _ in range(n_boot):
+        sampled = [frame_ids[rng.randrange(len(frame_ids))] for _ in range(len(frame_ids))]
+        idx = [i for f in sampled for i in groups[f]]
+        m = metric_fn(idx)
+        if m is not None:
+            stats.append(m)
+    if not stats:
+        return (point, point, point)
+    stats.sort()
+    lo = stats[min(len(stats) - 1, int((alpha / 2) * len(stats)))]
+    hi = stats[min(len(stats) - 1, int((1 - alpha / 2) * len(stats)))]
+    return (float(lo), float(point), float(hi))
+
+
+def balanced_accuracy_ci(frames, y_true_cog, scores, *, threshold: float = 0.5,
+                         n_boot: int = 1000, seed: int = DEFAULT_SEED) -> tuple[float, float, float]:
+    """Frame-resampled CI for balanced accuracy at ``threshold`` (argmax by default).
+
+    Convenience wrapper over ``bootstrap_ci`` for the headline metric, matching the argmax
+    (``p >= 0.5``) rule ``trainer._make_ok_row`` uses for the point estimate.
+    """
+    y = list(y_true_cog)
+    p = list(scores)
+
+    def metric_fn(idx):
+        yt = [y[i] for i in idx]
+        if len(set(yt)) < 2:
+            return None
+        yp = [1 if p[i] >= threshold else 0 for i in idx]
+        return balanced_accuracy(yt, yp)
+
+    return bootstrap_ci(frames, metric_fn, n_boot=n_boot, seed=seed)
+
+
+def ci_separated(ci: tuple[float, float, float], bar: float) -> bool:
+    """True iff the CI's lower bound is strictly above ``bar`` (a decisive win over a point)."""
+    return ci[0] > bar
+
+
+def cis_overlap(a: tuple[float, float, float], b: tuple[float, float, float]) -> bool:
+    """True iff two CIs overlap (the comparison is undecidable) — uses [lo, hi] of each."""
+    return not (a[2] < b[0] or b[2] < a[0])
+
+
+def per_frame_metrics(frames: Sequence[str], y_true_cog, y_pred_cog) -> list[dict]:
+    """One summary row per frame: tile/cog counts, cogongrass recall, balanced accuracy.
+
+    Surfaces whether failure is a few bad frames or systematic. ``recall_cog`` is ``None`` for
+    a frame with no cogongrass tiles; ``bacc`` is ``None`` when a frame is single-class.
+    """
+    groups = frame_groups(frames)
+    yt_all, yp_all = list(y_true_cog), list(y_pred_cog)
+    out = []
+    for f in sorted(groups):
+        idx = groups[f]
+        yt = [yt_all[i] for i in idx]
+        yp = [yp_all[i] for i in idx]
+        n_cog = int(sum(yt))
+        rec = per_class_recall(yt, yp)[COG_CLASS] if n_cog else None
+        bacc = balanced_accuracy(yt, yp) if len(set(yt)) == 2 else None
+        out.append({"frame": f, "n": len(idx), "n_cog": n_cog,
+                    "recall_cog": rec, "bacc": bacc})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Self-check: prints 0422 / 0606 frame + tile counts from the real dataset.
 # ---------------------------------------------------------------------------
 def _self_check(data_dir: str = "tiles_dataset") -> None:

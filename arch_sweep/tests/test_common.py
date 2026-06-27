@@ -230,6 +230,70 @@ def test_scores_sidecar_is_atomic_no_partial_on_interrupt(tmp_path, monkeypatch)
     assert not list(tmp_path.glob(".tmp-*")), "temp sidecar must be cleaned up on interrupt"
 
 
+# --- frame-resampled bootstrap CIs + per-frame breakdown (U2) -----------------
+def _two_frame_scores(sep=True):
+    """Two frames, 3 tiles each; separable (sep) or noisy. Returns (frames, y, scores)."""
+    frames = ["F1", "F1", "F1", "F2", "F2", "F2"]
+    y = [1, 1, 0, 1, 0, 0]
+    if sep:
+        scores = [0.95, 0.90, 0.05, 0.92, 0.08, 0.02]   # perfectly separable
+    else:
+        scores = [0.55, 0.45, 0.52, 0.48, 0.51, 0.49]   # near chance
+    return frames, y, scores
+
+
+def test_bootstrap_ci_tight_and_contains_point_on_separable():
+    frames, y, scores = _two_frame_scores(sep=True)
+    lo, point, hi = C.balanced_accuracy_ci(frames, y, scores, n_boot=200, seed=1)
+    assert point == 1.0
+    assert lo <= point <= hi
+    assert hi - lo < 0.2            # separable -> tight
+
+
+def test_bootstrap_ci_widens_on_noise():
+    frames, y, s_sep = _two_frame_scores(sep=True)
+    _f, _y, s_noisy = _two_frame_scores(sep=False)
+    sep = C.balanced_accuracy_ci(frames, y, s_sep, n_boot=300, seed=2)
+    noisy = C.balanced_accuracy_ci(frames, y, s_noisy, n_boot=300, seed=2)
+    assert (noisy[2] - noisy[0]) > (sep[2] - sep[0])   # noisy CI is wider
+
+
+def test_bootstrap_resamples_whole_frames_together():
+    # A frame's tiles must always appear the same number of times in a resample (move
+    # together) — assert via a metric_fn that inspects the per-tile multiplicity.
+    frames = ["A", "A", "B", "B", "B", "C"]
+    groups = C.frame_groups(frames)
+    assert groups == {"A": [0, 1], "B": [2, 3, 4], "C": [5]}
+    violations = []
+
+    def inspector(idx):
+        from collections import Counter
+        counts = Counter(idx)
+        for tiles in groups.values():
+            if len({counts[t] for t in tiles}) != 1:   # tiles of one frame differ in count
+                violations.append(tiles)
+        return 0.0
+
+    C.bootstrap_ci(frames, inspector, n_boot=50, seed=3)
+    assert not violations, "tiles of a frame split across a resample (leakage in the CI)"
+
+
+def test_ci_separation_helpers():
+    assert C.ci_separated((0.83, 0.85, 0.87), 0.817) is True
+    assert C.ci_separated((0.80, 0.84, 0.88), 0.817) is False   # lo below bar
+    assert C.cis_overlap((0.80, 0.84, 0.88), (0.85, 0.89, 0.92)) is True
+    assert C.cis_overlap((0.80, 0.82, 0.84), (0.85, 0.89, 0.92)) is False
+
+
+def test_per_frame_metrics_one_row_per_frame():
+    frames, y, scores = _two_frame_scores(sep=True)
+    pred = [1 if s >= 0.5 else 0 for s in scores]
+    pf = C.per_frame_metrics(frames, y, pred)
+    assert [r["frame"] for r in pf] == ["F1", "F2"]    # one row per frame, sorted
+    assert pf[0]["n"] == 3 and pf[0]["n_cog"] == 2
+    assert pf[0]["recall_cog"] == 1.0 and pf[0]["bacc"] == 1.0
+
+
 def test_read_all_results_ignores_scores_sidecars(tmp_path):
     # a result row + its scores sidecar share the dir and both match *.jsonl; the merge that
     # feeds the report must return only the result row, never parse the sidecar as a row.
