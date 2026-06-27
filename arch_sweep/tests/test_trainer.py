@@ -68,6 +68,28 @@ def test_train_and_eval_smoke_writes_one_row(tmp_path):
     assert C.read_result(files[0]).job_id == row.job_id
 
 
+def test_scores_sidecar_off_by_default(tmp_path):
+    samples, feats, labels = _synth()
+    T.train_and_eval(_cfg(), results_dir=tmp_path, samples=samples,
+                     features=feats, labels=labels, cog_idx=COG_IDX)
+    assert not list(tmp_path.glob("*.scores.jsonl"))   # off unless explicitly requested
+
+
+def test_scores_sidecar_written_one_row_per_0422_tile(tmp_path):
+    samples, feats, labels = _synth()
+    row = T.train_and_eval(_cfg(), results_dir=tmp_path, samples=samples, features=feats,
+                           labels=labels, cog_idx=COG_IDX, write_scores=True)
+    sidecars = list(tmp_path.glob("*.scores.jsonl"))
+    assert len(sidecars) == 1
+    recs = C.read_scores(sidecars[0])
+    n_te = len(C.indices_for_date(samples, C.TEST_DATE))
+    assert len(recs) == n_te == row.n_test
+    assert all(0.0 <= r.p_cogongrass <= 1.0 for r in recs)
+    assert all(r.frame and "20260422" in r.frame for r in recs)   # only held-out 0422 tiles
+    # the sidecar does not pollute the result merge that feeds the report
+    assert len(C.read_all_results(tmp_path)) == 1
+
+
 def test_both_head_variants_train(tmp_path):
     samples, feats, labels = _synth()
     for head in ("linear", "mlp_bn"):

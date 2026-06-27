@@ -364,13 +364,104 @@ def read_result(path: str | Path) -> ResultRow:
 
 
 def read_all_results(results_dir: Path | str = RESULTS_DIR) -> list[ResultRow]:
-    """Glob + merge every per-job result file (the report's input; KTD8)."""
+    """Glob + merge every per-job result file (the report's input; KTD8).
+
+    Per-tile score sidecars (``<job_id>.scores.jsonl``, U1) live in the same dir and also
+    match ``*.jsonl`` — they are skipped here so they never get parsed as result rows.
+    """
     out = []
     for p in sorted(Path(results_dir).glob("*.jsonl")):
+        if p.name.endswith(SCORES_SUFFIX):
+            continue   # a per-tile score sidecar, not a result row (U1)
         try:
             out.append(read_result(p))
         except ValueError:
             continue   # skip an empty/partial file rather than crash the report
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-tile confidence sidecar  (U1 — ScoreRecord ported from vlm_zeroshot)
+# ---------------------------------------------------------------------------
+# Persist per-tile ``P(cogongrass)`` once, alongside the result row, so label-cleaning (U3),
+# ensembling (U5), and self-training (U11) consume stored scores instead of recomputing them
+# (KTD3). The sidecar is ``results/<job_id>.scores.jsonl`` — same atomic temp->fsync->replace
+# path as the result row, one JSONL record per evaluated 0422 tile.
+SCORES_SUFFIX = ".scores.jsonl"
+
+
+@dataclass
+class ScoreRecord:
+    """One evaluated 0422 tile's persisted confidence (the vlm_zeroshot ScoreRecord shape)."""
+
+    path: str                    # tile path (frame-encoded; ``frame`` is derived from it)
+    frame: str                   # source frame stem (``frame_of(path)``)
+    true_label: str              # class name: "cogongrass" | "not_cogongrass"
+    p_cogongrass: float          # model P(cogongrass) in [0, 1]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ScoreRecord":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def build_score_records(paths, y_true_cog, scores) -> list[ScoreRecord]:
+    """Zip aligned ``(path, true 0/1 label, P(cog))`` triples into ScoreRecords.
+
+    ``y_true_cog`` is the 1==cogongrass / 0==not encoding used everywhere else; the class
+    name is derived from it so the sidecar is self-describing without the label map.
+    """
+    out = []
+    for p, y, pc in zip(paths, y_true_cog, scores):
+        out.append(ScoreRecord(path=str(p), frame=frame_of(str(p)),
+                               true_label=COG_CLASS if int(y) == 1 else "not_cogongrass",
+                               p_cogongrass=float(pc)))
+    return out
+
+
+def scores_path(config, results_dir: Path | str = RESULTS_DIR) -> Path:
+    """Path of the per-tile score sidecar for a cell (mirrors ``result_path``)."""
+    jid = config if isinstance(config, str) else job_id(config)
+    return Path(results_dir) / f"{jid}{SCORES_SUFFIX}"
+
+
+def write_scores_atomic(config, records: Sequence[ScoreRecord],
+                        results_dir: Path | str = RESULTS_DIR) -> Path:
+    """Write a cell's per-tile scores crash-safely: tmp -> flush -> fsync -> os.replace (U1).
+
+    Same atomicity guarantee as ``write_result_atomic`` — the final sidecar only ever appears
+    via an atomic rename of a fully-written temp file, so an interrupt leaves either the prior
+    sidecar or nothing, never a truncated file. ``config`` may be a ResultRow/dict/job_id str.
+    """
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    jid = config if isinstance(config, str) else job_id(config)
+    final = results_dir / f"{jid}{SCORES_SUFFIX}"
+    payload = "".join(json.dumps(r.to_dict(), default=str) + "\n" for r in records)
+    fd, tmp = tempfile.mkstemp(dir=results_dir, prefix=".tmp-", suffix=SCORES_SUFFIX)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, final)   # atomic on POSIX
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return final
+
+
+def read_scores(path: str | Path) -> list[ScoreRecord]:
+    """Read a per-tile score sidecar back into ScoreRecords (round-trips the writer)."""
+    out = []
+    with Path(path).open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(ScoreRecord.from_dict(json.loads(line)))
     return out
 
 

@@ -187,3 +187,54 @@ def test_written_row_is_valid_json_line(tmp_path):
     lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
     assert len(lines) == 1
     json.loads(lines[0])   # parses without error
+
+
+# --- per-tile confidence sidecar (U1) ----------------------------------------
+def _score_recs():
+    paths = ["tiles/cogongrass/DJI_20260422_0001_r0_c0.jpg",
+             "tiles/not_cogongrass/DJI_20260422_0001_r0_c1.jpg",
+             "tiles/not_cogongrass/DJI_20260422_0002_r1_c0.jpg"]
+    return C.build_score_records(paths, y_true_cog=[1, 0, 0], scores=[0.92, 0.04, 0.61])
+
+
+def test_build_score_records_derives_frame_and_class():
+    recs = _score_recs()
+    assert len(recs) == 3
+    assert recs[0].frame == "DJI_20260422_0001" and recs[0].true_label == "cogongrass"
+    assert recs[1].true_label == "not_cogongrass"
+    assert recs[2].frame == "DJI_20260422_0002" and recs[2].p_cogongrass == 0.61
+
+
+def test_scores_sidecar_round_trip(tmp_path):
+    cfg = {"model": "dinov2", "variant": "reference"}
+    recs = _score_recs()
+    path = C.write_scores_atomic(cfg, recs, tmp_path)
+    assert path.name.endswith(C.SCORES_SUFFIX)
+    assert path == C.scores_path(cfg, tmp_path)
+    back = C.read_scores(path)
+    assert back == recs            # identical round-trip
+    assert all(0.0 <= r.p_cogongrass <= 1.0 for r in back)
+
+
+def test_scores_sidecar_is_atomic_no_partial_on_interrupt(tmp_path, monkeypatch):
+    cfg = {"model": "dinov2", "variant": "reference"}
+    final = C.scores_path(cfg, tmp_path)
+
+    def boom(src, dst):
+        raise KeyboardInterrupt("interrupted before rename")
+
+    monkeypatch.setattr(C.os, "replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        C.write_scores_atomic(cfg, _score_recs(), tmp_path)
+    assert not final.exists()
+    assert not list(tmp_path.glob(".tmp-*")), "temp sidecar must be cleaned up on interrupt"
+
+
+def test_read_all_results_ignores_scores_sidecars(tmp_path):
+    # a result row + its scores sidecar share the dir and both match *.jsonl; the merge that
+    # feeds the report must return only the result row, never parse the sidecar as a row.
+    row = C.ResultRow(model="dinov2", variant="reference", balanced_accuracy=0.83)
+    C.write_result_atomic(row, tmp_path)
+    C.write_scores_atomic(row, _score_recs(), tmp_path)
+    merged = C.read_all_results(tmp_path)
+    assert len(merged) == 1 and merged[0].job_id == row.job_id

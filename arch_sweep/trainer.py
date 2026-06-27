@@ -271,7 +271,8 @@ def _train_finetune(cfg, cog_idx, tr_bal, va_idx, te_idx):
 
 
 def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
-                   features=None, labels=None, cog_idx=None) -> C.ResultRow:
+                   features=None, labels=None, cog_idx=None,
+                   write_scores=False) -> C.ResultRow:
     """Train one cell on 0606 and evaluate on held-out 0422; write the row.
 
     Dispatches on ``tuning_mode``: ``frozen`` trains a head on cached features (U4);
@@ -279,9 +280,15 @@ def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
     ``features`` / ``labels`` / ``cog_idx`` are injectable so the frozen loop is testable on a
     tiny synthetic feature set. Always writes a result row (even on failure) so the
     orchestrator's coverage accounting is honest (KTD8).
+
+    ``write_scores`` (U1) additionally persists a ``<job_id>.scores.jsonl`` sidecar with one
+    per-tile ``P(cogongrass)`` for every 0422 tile, so label-cleaning (U3) / ensembling (U5) /
+    self-training (U11) consume stored scores instead of recomputing (KTD3). Off by default so
+    tiny unit tests don't require it; ``run_cli`` turns it on for real runs.
     """
     import torch  # noqa: F401 — ensures the ML stack is present before we start
 
+    score_payload = None
     try:
         if features is None and cfg.tuning_mode == "frozen":
             data_dir = FEAT._variant_dir(cfg.variant)
@@ -312,11 +319,16 @@ def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
         row = _make_ok_row(cfg, p_val=p_val, y_val=y_val, p_te=p_te, y_te=y_te,
                            val_bacc=val_bacc, n_train=len(tr_bal), n_val=len(va_idx),
                            n_test=len(te_idx), n_trainable=n_trainable)
+        if write_scores:   # U1: persist per-tile P(cog) for every 0422 tile (KTD3)
+            te_paths = [samples[i][0] for i in te_idx]
+            score_payload = C.build_score_records(te_paths, y_te, p_te)
     except Exception as e:  # noqa: BLE001 — record the failure, never lose the cell (KTD8)
         status = "oom" if _is_oom(e) else "failed"
         row = C.ResultRow(**cfg.identity(), status=status, error=f"{type(e).__name__}: {e}"[:500])
 
     C.write_result_atomic(row, results_dir)
+    if score_payload is not None:   # written after the row, only on success; never fails a cell
+        C.write_scores_atomic(cfg.identity(), score_payload, results_dir)   # dict -> row's job_id
     return row
 
 
@@ -440,7 +452,7 @@ def run_cli(model: str | None = None, *, add_size: bool = False, argv=None) -> C
     if smoke:
         row = run_smoke(cfg, args.smoke_frames, args.smoke_tiles)
     else:
-        row = train_and_eval(cfg)
+        row = train_and_eval(cfg, write_scores=True)   # U1: real runs persist per-tile scores
     if row.status == "ok":
         print(f"\n0422 balanced accuracy: {row.balanced_accuracy:.3f}  "
               f"(recall cog {row.recall_cogongrass:.3f} / not {row.recall_not_cogongrass:.3f})  "
