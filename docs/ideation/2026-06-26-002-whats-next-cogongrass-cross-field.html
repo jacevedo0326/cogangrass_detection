@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What's next for cross-field cogongrass detection — ideation</title>
+<style>
+  :root { --ink:#1a1a1a; --mut:#666; --line:#e2e2e2; --accent:#1f6f43; --warn:#9a3b1b; --bg:#fafafa; }
+  body { font: 16px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--ink);
+         max-width: 880px; margin: 2rem auto; padding: 0 1.1rem; background:var(--bg); }
+  h1 { font-size: 1.6rem; line-height:1.25; margin-bottom:.2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.2rem; border-bottom:2px solid var(--line); padding-bottom:.3rem; }
+  h3 { font-size: 1.05rem; margin-bottom:.2rem; }
+  .sub { color:var(--mut); margin-top:0; }
+  .tldr { background:#eef6f0; border-left:4px solid var(--accent); padding:.8rem 1rem; border-radius:6px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:1rem 1.1rem; margin:1rem 0; }
+  .rank { display:inline-block; background:var(--accent); color:#fff; border-radius:50%; width:1.7rem; height:1.7rem;
+          text-align:center; line-height:1.7rem; font-weight:700; margin-right:.5rem; }
+  .tier { font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; font-weight:700; padding:.12rem .5rem;
+          border-radius:999px; vertical-align:middle; }
+  .cheap { background:#e7f3ea; color:var(--accent); }
+  .med { background:#fff3e0; color:#8a5a00; }
+  .big { background:#e8eef9; color:#23468c; }
+  table { border-collapse: collapse; width:100%; margin:.4rem 0; font-size:.92rem; }
+  th,td { border:1px solid var(--line); padding:.35rem .5rem; text-align:left; vertical-align:top; }
+  th { background:#f1f1f1; }
+  .meta { font-size:.9rem; color:var(--mut); }
+  .reject td:first-child { color:var(--warn); font-weight:600; white-space:nowrap; }
+  code { background:#f0f0f0; padding:.05rem .3rem; border-radius:4px; font-size:.86em; }
+  .basis { font-size:.85rem; color:var(--mut); margin-top:.4rem; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>What's next for cross-field cogongrass detection?</h1>
+<p class="sub">Ideation · 2026-06-26 · grounds on the completed <code>arch_sweep</code> results · extends
+<a href="2026-06-26-best-vision-model-cogongrass-domain-shift.html">the prior "best vision model" ideation</a>.
+This is an idea menu, not a plan — pick one and run <code>/ce-brainstorm</code> on it.</p>
+
+<div class="tldr">
+<strong>Short answer: no, we haven't exhausted the space — and we can't yet even be sure what "best" is.</strong>
+The sweep so far explored exactly <em>one</em> family: a frozen foundation backbone + a small head + test-time
+adaptation (best = aimv2 + EATA, <strong>0.839</strong>, tying the original ~0.84). Four whole families are
+untouched: <strong>(1) fixing the noisy ground truth we score against</strong>, <strong>(2) combining the models
+we already have</strong> (ensembles/calibration — nearly free off the cached features), <strong>(3) a different
+problem formulation</strong> (promptable detection / segmentation that re-anchors to each new field), and
+<strong>(4) remote-sensing-specific domain-generalization</strong>. The highest-leverage next move isn't a new
+backbone — it's the cheap combination of #1 and #2.
+</div>
+
+<h2>The ranked survivors</h2>
+
+<div class="card">
+<h3><span class="rank">1</span>Clean the test labels &amp; fix the ruler <span class="tier med">medium · ceiling-raiser</span></h3>
+<p><strong>What:</strong> Run the existing <code>suspect_negatives.py</code> / <code>fp_audit.py</code> to surface
+0422 tiles the models confidently call cogongrass but ground truth marks negative, hand-correct them in
+<code>label_tiles.py</code>, and freeze a clean <code>tiles_dataset_0422clean/</code> eval variant. Pair with
+<strong>evaluation hygiene</strong>: frame-level bootstrap confidence intervals + per-frame breakdown + report
+metrics against both noisy and clean ground truth.</p>
+<p><strong>Why it's #1:</strong> Labels are "not-boxed = negative" and "no box file = all-negative," so every missed
+annotation becomes a false negative in the answer key. <strong>AUROC ~0.90 with argmax recall ~0.6 is the
+fingerprint of label noise, not a weak model</strong> — the model already ranks these tiles correctly; the
+disagreement is the label. Until the ruler is clean (and has error bars — with only 2 collections, 0.804 vs 0.839
+may be within noise), we literally cannot tell which architecture is best.</p>
+<p class="meta"><strong>Impact:</strong> large (and compounds every other result) · <strong>Effort:</strong> medium
+(human-in-loop; tooling exists but needs repointing from the legacy 160/1280 config to 512/4096) ·
+<strong>Harness:</strong> a <code>VariantSpec</code> over corrected labels + <code>bootstrap_ci()</code> in
+<code>common.py</code>; re-run the sweep, every number in the report becomes trustworthy.</p>
+<p class="basis">Basis: our AUROC/recall gap; repo's own <code>suspect_negatives.csv</code> tooling; external
+SAM2-ELNet label-enhancement (<a href="https://arxiv.org/pdf/2503.12404">arxiv 2503.12404</a>).</p>
+</div>
+
+<div class="card">
+<h3><span class="rank">2</span>Decorrelated ensemble of the top backbones (+ per-member EATA) <span class="tier cheap">cheap · high-EV</span></h3>
+<p><strong>What:</strong> Average the per-tile cogongrass probabilities of the top 4 backbones (siglip2, aimv2,
+cradio, dinov3_sat), each with its EATA-adapted head. Two tiers: average frozen heads, then average TTA-adapted
+heads.</p>
+<p><strong>Why:</strong> All four sit at AUROC ~0.90 but come from genuinely different pretraining objectives
+(image-text contrastive, autoregressive, agglomerative, satellite SSL), so their <em>errors</em> on a never-seen
+field are likely decorrelated even though their ranking quality is similar — the textbook setup where probability
+averaging jumps accuracy. EATA already beats baseline on each member individually (0.839/0.832/0.828/0.821).</p>
+<p class="meta"><strong>Impact:</strong> +0.01–0.03 → plausibly ~0.85–0.86 · <strong>Effort:</strong> hours (pure
+cache reads + 4 tiny heads) · <strong>Harness:</strong> new <code>models/ensemble.py</code> loading cached
+features via <code>features.load_features</code>, reusing <code>trainer.train_head</code> + <code>tta.adapt_head</code>
++ <code>_make_ok_row</code>; one <code>ResultRow</code> with <code>extra="ensemble=..."</code>.</p>
+<p class="basis">Basis: our 10 cached feature banks at AUROC ~0.90; classic ensemble-of-decorrelated-learners.</p>
+</div>
+
+<div class="card">
+<h3><span class="rank">3</span>Use the operating threshold we already fit (calibration for the FN-costly setting) <span class="tier cheap">cheap · high-EV</span></h3>
+<p><strong>What:</strong> The headline balanced accuracy is computed at <strong>argmax 0.5</strong> — the F2-optimal
+threshold fit on 0606 (<code>pick_threshold_on</code>) is <em>recorded but never applied</em>. Apply it; add
+temperature scaling on 0606, AdaBN score alignment on 0422, and <strong>prior-matching</strong> (pick the 0422
+threshold so predicted positive fraction matches known prevalence). Report cogongrass recall / F2 at that point.</p>
+<p><strong>Why:</strong> Argmax recall ~0.6 is the single largest source of <em>false negatives</em> — the costly
+error. The fitted op-thresholds (~0.30–0.44) are exactly what raises recall toward the ~0.85 regime AdaBN/RoTTA
+already reach. Prior-matching is label-free (uses only the unlabeled 0422 score distribution + the class prior),
+so it stays an honest cross-collection result.</p>
+<p class="meta"><strong>Impact:</strong> cogongrass recall ~0.6 → ~0.85, large F2 gain · <strong>Effort:</strong> ~1
+hour (scoring-path change in <code>_make_ok_row</code>) · <strong>Harness:</strong> add an <code>eval_threshold</code>
+policy; true conformal FN-rate control needs labels → route via the existing <code>few_shot</code> track.</p>
+<p class="basis">Basis: <code>trainer._make_ok_row</code> argmax line; the unused <code>pick_threshold_on</code> /
+<code>f2_sweep</code> machinery.</p>
+</div>
+
+<div class="card">
+<h3><span class="rank">4</span>Deploy-time promptable detection with visual exemplars (T-Rex2 / T-Rex-Omni) <span class="tier big">new mechanism</span></h3>
+<p><strong>What:</strong> Drop the frozen classifier. On a new field, supply 2–5 example boxes of cogongrass; an
+open-vocab/visual-prompt detector (T-Rex2, with T-Rex-Omni <em>negative</em> prompts for look-alike grasses)
+detects all similar regions, rasterized onto the same 512px tile grid → heatmap.</p>
+<p><strong>Why:</strong> It's the only approach that <strong>re-anchors per field at deploy time</strong> instead of
+freezing a decision boundary on 0606. Matching is relative ("find more like these, in <em>this</em> image"), which
+sidesteps the exact covariate shift (white balance, sun angle, phenology) TTA is clawing ~2 pts back against.
+Negative prompts directly target the costly false positives. Risk: cogongrass coverage is diffuse texture, not
+discrete countable objects, and the view is oblique — visual-prompt detectors may under-segment dense patches.</p>
+<p class="meta"><strong>Impact:</strong> high upside on cross-field robustness; could exceed 0.84 because it adapts ·
+<strong>Effort:</strong> medium (new standalone harness; runs on GB10) · <strong>Comparability:</strong> rasterize
+detections to the 0422 grid → identical balanced-accuracy / recall / AUROC protocol.</p>
+<p class="basis">Basis: T-Rex2 (<a href="https://arxiv.org/pdf/2403.14610">2403.14610</a>), T-Rex-Omni negative prompts
+(<a href="https://arxiv.org/pdf/2511.08997">2511.08997</a>); plant-prompting calibration "Does Your VFM Speak
+Plant?" (<a href="https://arxiv.org/html/2604.09920v1">2604.09920</a>).</p>
+</div>
+
+<div class="card">
+<h3><span class="rank">5</span>The cheap cached-feature stack: CORAL alignment · feature-concat · multi-scale/flip TTA <span class="tier cheap">cheap · high-EV</span></h3>
+<p><strong>What:</strong> Three label-free levers that all run off the cached features and <em>stack</em> with #2/#3:
+<strong>(a) CORAL</strong> — re-color 0606 features to 0422's second-order statistics before training the head;
+<strong>(b) early-fusion concat</strong> — concatenate 2–4 backbones' feature vectors into one wide head (learns
+cross-backbone interactions vs #2's late fusion); <strong>(c) multi-scale + flip TTA</strong> — cache tile256/tile512
++ flipped views and average head probs.</p>
+<p><strong>Why:</strong> CORAL removes the dominant linear part of the covariate shift using only the unlabeled 0422
+feature matrix (already cached) — complementary to AdaBN (which fixes the head's normalization, not its input).
+Concat captures complementary signal averaging can't. Multi-scale smooths nuisance scale/orientation variation.</p>
+<p class="meta"><strong>Impact:</strong> +0.01–0.02 each, stackable · <strong>Effort:</strong> CORAL/concat hours
+(cache matmuls); multi-scale needs one fresh extraction pass per view · <strong>Harness:</strong> CORAL as an
+<code>adaptation="coral"</code> preprocessing in <code>_train_frozen</code>; concat in the ensemble combiner; views
+via <code>data_variants.py</code> + the per-(backbone,variant) cache.</p>
+<p class="basis">Basis: cached features at AUROC ~0.90; CORAL/DANN domain adaptation; RS frequency-DG (FrogDogNet
+<a href="https://arxiv.org/pdf/2504.16433">2504.16433</a>).</p>
+</div>
+
+<div class="card">
+<h3><span class="rank">6</span>SAM-family: tighten the labels &amp; a segmentation/coverage reframe <span class="tier med">medium · ceiling + deliverable</span></h3>
+<p><strong>What:</strong> Two uses of SAM2/SAM-3. <strong>(a) Label repair (offline):</strong> intersect each YOLO
+box with SAM masks so a tile is positive only where actual grass pixels (not the loose oblique rectangle's
+background corners) fall — replacing the crude ≥30%-of-box rule, lifting <em>every</em> track's ceiling.
+<strong>(b) Deploy reframe:</strong> "segment everything" → classify each mask region by texture / exemplar
+embedding → pixel-level coverage (the true deliverable, vs blocky tiles).</p>
+<p><strong>Why:</strong> Each 512px tile currently mixes cogongrass, other grass, soil and sky, so the label is
+applied to a heterogeneous patch — a tighter region is a cleaner, more transferable texture signal, and masks are
+the truest form of "coverage." <code>sam_explore.py</code> already exists (was capped at SAM2-tiny on the old 6 GB
+card; the GB10 unlocks SAM2-large / SAM 3).</p>
+<p class="meta"><strong>Impact:</strong> high, partly compounding (label repair lifts the 0.817 baseline too) ·
+<strong>Effort:</strong> low–medium (label repair is a one-time pass) · <strong>Comparability:</strong> collapse
+masks to per-tile labels for the standard metric; add pixel IoU / coverage-MAE as the richer native score.</p>
+<p class="basis">Basis: SAM 3 concept/exemplar segmentation (<a href="https://arxiv.org/abs/2511.16719">2511.16719</a>);
+ASAMPS prompt-free ag SAM2 (<a href="https://www.tandfonline.com/doi/full/10.1080/17538947.2026.2645885">2026</a>);
+repo's <code>sam_explore.py</code>.</p>
+</div>
+
+<div class="card">
+<h3><span class="rank">7</span>Make TTA deployment-real and compound it: per-frame SAR/CoTTA · fine-tune+TTA · ensemble-agreement self-training <span class="tier med">medium</span></h3>
+<p><strong>What:</strong> A cluster that extends the winning TTA lever. <strong>(a) Per-frame robust TTA:</strong> add
+SAR and CoTTA to <code>tta.py</code> and an episodic per-frame mode — because <code>heatmap_infer.py</code> adapts
+one frame's tiles at a time (small, imbalanced batches where plain TENT collapses), unlike our whole-pool eval.
+<strong>(b) Stack fine-tune + TTA:</strong> run EATA on top of the LoRA-adapted backbone (currently the finetune
+path never calls <code>adapt_head</code>) — a clean A/B once LoRA finishes. <strong>(c) Ensemble-agreement
+pseudo-labeling:</strong> add 0422 tiles where ≥3/4 backbones agree at high confidence to training — agreement
+across decorrelated models is a far stronger reliability filter than single-model entropy (avoids confirmation
+bias).</p>
+<p class="meta"><strong>Impact:</strong> (a) stabilizes the real heatmap; (b) +0.005–0.015 if shifts are
+complementary; (c) higher ceiling, higher variance · <strong>Effort:</strong> medium, mostly feature-space &amp;
+CPU-testable like the rest of <code>tta.py</code>.</p>
+<p class="basis">Basis: SAR / CoTTA / TestDG (<a href="https://arxiv.org/html/2504.04981">2504.04981</a>); our EATA
+result + the running LoRA cell; pseudo-labeling with ensemble gating.</p>
+</div>
+
+<h2>The ceiling system (if you combined the survivors)</h2>
+<p>Cleanest high-confidence stack, mostly cheap: <strong>clean labels + error bars (#1)</strong> → score a
+<strong>CORAL-aligned (#5a) ensemble of EATA-adapted top-4 backbones (#2)</strong> at a
+<strong>prior-matched / F2 threshold (#3)</strong>. That is achievable in roughly a day off the existing cache and
+plausibly lands ~0.85–0.87 <em>on a trustworthy ruler</em>. The genuinely new mechanism to test in parallel is
+<strong>visual-exemplar promptable detection (#4)</strong>, the only path that adapts to each field rather than
+generalizing blindly — and the segmentation/coverage reframe (#6) is the one that matches the real deliverable.</p>
+
+<h2>Rejected — and why</h2>
+<table class="reject">
+<tr><th>Idea</th><th>Why not</th></tr>
+<tr><td>VLM as the classifier</td><td>Already falsified — Qwen2-VL-7B over all 7,006 0422 tiles scored ~0.572
+balanced accuracy / 0.535 AUROC (near chance). Keep VLMs only as offline label-cleaners (#1), not detectors.</td></tr>
+<tr><td>One-class / novelty detection</td><td>Cogongrass is ~28% of the held-out tiles — not rare, so the
+"outlier" assumption breaks. Viable only as a re-ranking/abstention layer, not a standalone detector.</td></tr>
+<tr><td>Bi-temporal change detection</td><td>Blocked by data: 0606 and 0422 are two <em>different fields</em>, not
+repeat flights of one. It's a "what to collect next" roadmap item (one revisit weeks apart unlocks it), not runnable
+today.</td></tr>
+<tr><td>Naïve single-model self-training</td><td>Confirmation bias amplifies the very label noise we're fighting.
+Only the ensemble-agreement-gated version (#7c) survives.</td></tr>
+<tr><td>Yet another single backbone</td><td>We swept 10; AUROC is uniformly ~0.90. Adding an 11th frozen backbone
+is low-EV vs combining the ones we have (#2) or fixing the ruler (#1). (A weed-specific foundation model like WeedNet
+is a mild exception worth one slot, not a program.)</td></tr>
+</table>
+
+<h2>Grounding context</h2>
+<ul>
+<li><strong>Status:</strong> frozen tournament (10 backbones, top 0.793) + TTA arm done — aimv2+EATA <strong>0.839</strong>
+beats the 0.817 baseline and ties the original ~0.84; LoRA/full fine-tune on aimv2 running now. Continued-SSL and
+few-shot harnesses built but not fully run.</li>
+<li><strong>Protocol:</strong> train collection 0606 → test entirely held-out field 0422 (7,006 tiles, ~28%
+positive); balanced accuracy + per-class recall; false negatives costly (F2). Single GB10 GPU; features cached per
+backbone.</li>
+<li><strong>Central finding:</strong> the ground truth is noisy ("not-boxed = negative"), so measured scores are a
+pessimistic floor and model ranking is uncertain without confidence intervals — which is why "fix the ruler" tops
+the list.</li>
+<li><strong>Axes covered:</strong> data/labels &amp; evaluation · model combination &amp; calibration · problem
+reframes (detection/segmentation/weak-supervision) · RS-specific domain generalization &amp; robust TTA.</li>
+</ul>
+
+<h2>Next steps</h2>
+<ol>
+<li><strong>Brainstorm one</strong> — run <code>/ce-brainstorm</code> on a survivor to turn it into requirements. Best
+first candidates: <em>#1 (clean labels + error bars)</em> or <em>#2 (ensemble)</em> — both cheap, both unblock or
+amplify everything else.</li>
+<li><strong>Quick win now</strong> — #2 and #3 are hours off the existing cache and need no new data; #3 directly
+attacks the false negatives you care most about.</li>
+<li><strong>Bigger bet</strong> — #4 (visual-exemplar detection) or #6 (SAM segmentation) if you want a new
+generalization mechanism rather than squeezing the current one.</li>
+</ol>
+
+</body>
+</html>
