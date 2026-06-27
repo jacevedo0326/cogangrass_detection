@@ -19,6 +19,11 @@ jobs:
   - {model: dinov3, size: l}
   - {model: dinov3, size: sat}
 
+  # Stage 2 — TTA arm on the frozen winners (U8). Reuses cached features; the un-adapted
+  # (adaptation=none) cells already exist above, so resume runs only these adapted cells.
+  - {model: [siglip2, aimv2, cradio], adaptation: [adabn, eata, rotta]}
+  - {model: dinov3, size: sat, adaptation: [adabn, eata, rotta]}
+
 # Stage 2 — carry the frozen winners into the expensive arms. Uncomment as the
 # units land and the variants are materialized (data_variants.py):
 #
