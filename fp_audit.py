@@ -16,7 +16,9 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 
-TILE, MAX, CNN, VEG, COG = 160, 1280, 224, 0.03, 0.5
+# Full-res pipeline config (CLAUDE.md): tile at 512 on PREP_MAX=4096 frames; the resnet18
+# tile_classifier still takes a 224 crop. Repointed from the legacy 160/1280 (arch_sweep U3).
+TILE, MAX, CNN, VEG, COG = 512, 4096, 224, 0.03, 0.5
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 device = "cuda" if torch.cuda.is_available() else "cpu"
 norm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(MEAN, STD)])

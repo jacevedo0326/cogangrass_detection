@@ -7,9 +7,11 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import common as C  # noqa: E402
 import data_variants as DV  # noqa: E402
 
 
@@ -17,6 +19,7 @@ import data_variants as DV  # noqa: E402
 def test_reference_variants_point_at_existing_dirs():
     assert DV.VARIANTS_BY_NAME["reference"].dir_name() == "tiles_dataset"
     assert DV.VARIANTS_BY_NAME["reference_clahe"].dir_name() == "tiles_dataset_clahe"
+    assert DV.VARIANTS_BY_NAME["reference_0422clean"].dir_name() == "tiles_dataset_0422clean"
 
 
 def test_canonical_names_encode_the_axes():
@@ -93,3 +96,67 @@ def test_manifest_is_idempotent(tmp_path):
     first = DV.build_manifest(specs, root=tmp_path, manifest_path=mp)
     second = DV.build_manifest(specs, root=tmp_path, manifest_path=mp)
     assert first == second   # re-scanning an unchanged tree is a no-op
+
+
+# --- U3: suspect-negative ranking + cleaned 0422 variant ----------------------
+def _scores(triples):
+    """triples: list of (path, true_label, p_cog) -> list[ScoreRecord]."""
+    return [C.ScoreRecord(path=p, frame=C.frame_of(p), true_label=lab, p_cogongrass=pc)
+            for p, lab, pc in triples]
+
+
+def test_rank_suspect_negatives_surfaces_high_confidence_negatives():
+    recs = _scores([
+        ("tiles/not_cogongrass/DJI_20260422_0001_r0_c0.jpg", "not_cogongrass", 0.97),  # suspect
+        ("tiles/not_cogongrass/DJI_20260422_0001_r0_c1.jpg", "not_cogongrass", 0.10),  # fine
+        ("tiles/cogongrass/DJI_20260422_0002_r0_c0.jpg", "cogongrass", 0.99),          # not a neg
+        ("tiles/not_cogongrass/DJI_20260606_0003_r0_c0.jpg", "not_cogongrass", 0.95),  # wrong date
+    ])
+    sus = DV.rank_suspect_negatives(recs, min_p=0.5)
+    assert [s["frame"] for s in sus] == ["DJI_20260422_0001"]   # only the 0422 high-conf negative
+    assert sus[0]["p_cogongrass"] == 0.97
+
+
+def test_merge_sidecar_scores_averages_and_checks_alignment():
+    a = _scores([("t/not_cogongrass/DJI_20260422_0001_r0_c0.jpg", "not_cogongrass", 0.8)])
+    b = _scores([("t/not_cogongrass/DJI_20260422_0001_r0_c0.jpg", "not_cogongrass", 0.6)])
+    merged = DV.merge_sidecar_scores([a, b])
+    assert merged[0].p_cogongrass == pytest.approx(0.7)
+    # a sidecar with a different path set is rejected, not silently averaged
+    c = _scores([("t/not_cogongrass/DJI_20260422_0009_r0_c0.jpg", "not_cogongrass", 0.6)])
+    try:
+        DV.merge_sidecar_scores([a, c])
+        assert False, "expected a path-mismatch error"
+    except ValueError:
+        pass
+
+
+def _make_unique_variant(root: Path, n_cog: int, n_neg: int):
+    """Like _make_variant_dir but filenames are unique across classes (real tiles always are)."""
+    base = root / "tiles_dataset"
+    for i in range(n_cog):
+        (base / "cogongrass").mkdir(parents=True, exist_ok=True)
+        (base / "cogongrass" / f"DJI_20260422_0001_r0_c{i}.jpg").write_bytes(b"x")
+    for i in range(n_neg):
+        (base / "not_cogongrass").mkdir(parents=True, exist_ok=True)
+        (base / "not_cogongrass" / f"DJI_20260422_0002_r1_c{i}.jpg").write_bytes(b"x")
+
+
+def test_build_clean_variant_flips_relabeled_tiles_and_is_enumerable(tmp_path):
+    _make_unique_variant(tmp_path, n_cog=1, n_neg=3)
+    flip = "DJI_20260422_0002_r1_c0.jpg"   # a not_cogongrass tile that is really cogongrass
+    before = DV.class_counts(C.enumerate_tiles(str(tmp_path / "tiles_dataset"))[0])
+    out, n_flipped = DV.build_clean_variant({flip: "cogongrass"}, root=tmp_path)
+    assert n_flipped == 1 and out.name == "tiles_dataset_0422clean"
+    samples, _classes, _cog = C.enumerate_tiles(str(out))
+    after = DV.class_counts(samples)
+    assert after["total"] == before["total"]                 # no tiles lost
+    assert after["cogongrass"] == before["cogongrass"] + 1   # exactly one negative flipped
+    assert after["not_cogongrass"] == before["not_cogongrass"] - 1
+
+
+def test_build_clean_variant_is_idempotent(tmp_path):
+    _make_unique_variant(tmp_path, n_cog=1, n_neg=2)
+    DV.build_clean_variant({}, root=tmp_path)
+    out, n_flipped = DV.build_clean_variant({}, root=tmp_path)   # second call is a no-op
+    assert n_flipped == 0

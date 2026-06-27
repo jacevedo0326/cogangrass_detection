@@ -134,6 +134,8 @@ class VariantSpec:
 STANDARD_VARIANTS = [
     VariantSpec("reference", dir_override="tiles_dataset"),
     VariantSpec("reference_clahe", clahe=True, dir_override="tiles_dataset_clahe"),
+    # Cleaned 0422 eval variant (U3): reference tiling with suspect 0422 negatives corrected.
+    VariantSpec("reference_0422clean", dir_override="tiles_dataset_0422clean"),
     VariantSpec("tile224", tile_px=224, tile_save_px=224),
     VariantSpec("tile224_clahe", tile_px=224, tile_save_px=224, clahe=True),
     VariantSpec("tile512", tile_px=512, tile_save_px=512),
@@ -240,6 +242,118 @@ def materialize(spec: VariantSpec, root: Path | str = REPO_ROOT, overwrite: bool
     print(f"[built] {spec.name} -> {out}: {n_pos} cogongrass + {n_neg} not_cogongrass "
           f"({n_drop} dropped)")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Label cleaning -> cleaned 0422 variant  (U3 — consumes the U1 score sidecars, KTD3)
+# ---------------------------------------------------------------------------
+def merge_sidecar_scores(sidecars):
+    """Average ``p_cogongrass`` across one-or-more U1 sidecars, aligned by tile path.
+
+    Each sidecar is a ``list[common.ScoreRecord]``. Path sets must match exactly across
+    sidecars — a mismatch is raised, not silently averaged (the same alignment discipline U5
+    uses). With a single sidecar this is the identity. Returns a merged ``list[ScoreRecord]``.
+    """
+    import common as C
+
+    if not sidecars:
+        return []
+    ref_paths = [r.path for r in sidecars[0]]
+    ref_set = set(ref_paths)
+    for s in sidecars[1:]:
+        if {r.path for r in s} != ref_set:
+            raise ValueError("sidecar path sets differ — cannot ensemble-average for cleaning")
+    by_path: dict[str, list] = {}
+    for s in sidecars:
+        for r in s:
+            by_path.setdefault(r.path, []).append(r)
+    out = []
+    for p in ref_paths:
+        recs = by_path[p]
+        mean_p = sum(r.p_cogongrass for r in recs) / len(recs)
+        out.append(C.ScoreRecord(path=p, frame=recs[0].frame,
+                                 true_label=recs[0].true_label, p_cogongrass=mean_p))
+    return out
+
+
+def rank_suspect_negatives(records, *, min_p: float = 0.5, date: str = "20260422"):
+    """Rank true-NEGATIVE tiles by model ``P(cogongrass)`` desc — the likely-mislabeled (R1).
+
+    Only ``not_cogongrass`` tiles in collection ``date`` with ``p_cogongrass >= min_p`` are
+    returned, highest-confidence first — the review queue for ``label_tiles.py``. ``date=None``
+    disables the collection filter (for synthetic fixtures).
+    """
+    import common as C
+
+    out = []
+    for r in records:
+        if r.true_label == C.COG_CLASS:
+            continue
+        if date and C.date_of(r.frame) != date:
+            continue
+        if r.p_cogongrass >= min_p:
+            out.append({"path": r.path, "frame": r.frame, "p_cogongrass": r.p_cogongrass})
+    out.sort(key=lambda d: -d["p_cogongrass"])
+    return out
+
+
+def class_counts(samples, *, date: str | None = None) -> dict:
+    """Per-class tile counts (optionally for one collection) — the pre-relabel snapshot (U3).
+
+    Class is read from each tile's parent folder (the ImageFolder label), so the snapshot is
+    robust to the label-index map. ``date`` restricts to one collection (e.g. ``"20260422"``).
+    """
+    import common as C
+
+    counts = {c: 0 for c in CLASSES}
+    for p, _lab in samples:
+        if date and C.date_of(C.frame_of(p)) != date:
+            continue
+        cls = Path(p).parent.name
+        if cls in counts:
+            counts[cls] += 1
+    counts["total"] = sum(counts[c] for c in CLASSES)
+    return counts
+
+
+def build_clean_variant(relabel: dict, *, root: Path | str = REPO_ROOT, source: str = "reference",
+                        out_name: str = "reference_0422clean", overwrite: bool = False) -> tuple[Path, int]:
+    """Materialize the cleaned eval variant from a ``{tile_filename: corrected_class}`` map.
+
+    Every source tile is hard-linked (copy fallback) into the out variant under its class;
+    only tiles named in ``relabel`` move to the corrected class. Same image bytes, corrected
+    ground truth — the clean ruler U2's report column reads. Idempotent. Returns
+    ``(out_dir, n_flipped)``.
+    """
+    import shutil
+
+    src = VARIANTS_BY_NAME[source].path(root)
+    out = VARIANTS_BY_NAME[out_name].path(root)
+    if out.exists() and (count_tiles(out) or {}).get("total", 0) > 0 and not overwrite:
+        print(f"[skip] {out_name}: {out} already populated")
+        return out, 0
+    for cls in CLASSES:
+        (out / cls).mkdir(parents=True, exist_ok=True)
+    n_flipped = 0
+    for cls in CLASSES:
+        for tile in sorted((src / cls).glob("*.jpg")):
+            corrected = relabel.get(tile.name, cls)
+            if corrected not in CLASSES:
+                corrected = cls
+            if corrected != cls:
+                n_flipped += 1
+            dst = out / corrected / tile.name
+            if dst.exists():
+                if overwrite:
+                    dst.unlink()
+                else:
+                    continue
+            try:
+                os.link(tile, dst)              # hardlink: no extra disk for the shared bytes
+            except OSError:
+                shutil.copy2(tile, dst)         # cross-device / unsupported -> copy
+    print(f"[built] {out_name} -> {out}: {n_flipped} tiles relabeled vs {source}")
+    return out, n_flipped
 
 
 def main():
