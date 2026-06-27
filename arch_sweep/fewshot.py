@@ -192,3 +192,60 @@ def run_fewshot(model, features, labels, samples, cog_idx, *, adapter="prototype
     if write:
         C.write_result_atomic(row, results_dir)
     return row
+
+
+# ---------------------------------------------------------------------------
+# Runnable sweep entry (U7): run every adapter × budget on a backbone's cached features
+# ---------------------------------------------------------------------------
+DEFAULT_BUDGETS = [8, 16, 40, 80]
+
+
+def run_fewshot_sweep(model, features, labels, samples, cog_idx, *, adapters=ADAPTERS,
+                      budgets=DEFAULT_BUDGETS, seed=C.DEFAULT_SEED, variant="reference",
+                      results_dir=C.RESULTS_DIR, write=True) -> list[C.ResultRow]:
+    """Run every ``adapter × budget`` cell on one backbone's cached 0422 features.
+
+    Each cell is its own ``few_shot`` ResultRow (distinct ``adaptation``/``extra`` -> distinct
+    ``job_id``), so they merge into the report's separate few-shot table (KTD4) and never touch
+    the cross-collection ranking. Returns the rows.
+    """
+    rows = []
+    for adapter in adapters:
+        for budget in budgets:
+            rows.append(run_fewshot(model, features, labels, samples, cog_idx, adapter=adapter,
+                                    budget=budget, seed=seed, variant=variant,
+                                    results_dir=results_dir, write=write))
+    return rows
+
+
+def main():
+    import argparse
+
+    import features as FEAT
+
+    ap = argparse.ArgumentParser(description="Few-shot 0422 adaptation sweep (U7; few_shot table)")
+    ap.add_argument("--model", required=True, help="backbone with cached features (features.py)")
+    ap.add_argument("--variant", default="reference")
+    ap.add_argument("--adapters", default=",".join(ADAPTERS))
+    ap.add_argument("--budgets", default=",".join(str(b) for b in DEFAULT_BUDGETS))
+    ap.add_argument("--seed", type=int, default=C.DEFAULT_SEED)
+    args = ap.parse_args()
+
+    cache = FEAT.load_features(args.model, args.variant)
+    if cache is None:
+        raise SystemExit(f"no cached features for {args.model}×{args.variant} — run features.py first")
+    samples = list(zip(cache["paths"], [int(x) for x in cache["labels"]]))
+    cog_idx = C.CLASSES.index(C.COG_CLASS)
+    adapters = [a.strip() for a in args.adapters.split(",") if a.strip()]
+    budgets = [int(b) for b in args.budgets.split(",")]
+    print(f"== few-shot sweep {args.model}  adapters={adapters} budgets={budgets} ==", flush=True)
+    rows = run_fewshot_sweep(args.model, cache["features"], cache["labels"], samples, cog_idx,
+                             adapters=adapters, budgets=budgets, seed=args.seed,
+                             variant=args.variant)
+    for r in rows:
+        print(f"  {r.adaptation:18s} budget={r.budget:<3} -> bacc {r.balanced_accuracy:.3f} "
+              f"(recall cog {r.recall_cogongrass:.3f})")
+
+
+if __name__ == "__main__":
+    main()

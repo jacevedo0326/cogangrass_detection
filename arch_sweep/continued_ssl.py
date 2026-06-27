@@ -172,3 +172,102 @@ def load_ssl_backbone(base_name: str, ckpt_path: str | Path):
     B.inject_lora(ext.model, rank=ckpt.get("meta", {}).get("lora_rank", 8))
     ext.model.load_state_dict(ckpt["state"], strict=False)
     return ext
+
+
+# ---------------------------------------------------------------------------
+# Runnable pretrain entry (U7): wire a real backbone into the unlabeled SSL loop
+# ---------------------------------------------------------------------------
+def _two_views_fn():
+    """Two independent stochastic views of a preprocessed batch (flip + jitter; label-free)."""
+    import torch
+
+    def two_views(x):
+        def view():
+            v = x
+            if bool(torch.rand(1).item() < 0.5):
+                v = torch.flip(v, dims=[-1])               # random horizontal flip
+            return v + 0.02 * torch.randn_like(v)          # light feature jitter
+        return view(), view()
+
+    return two_views
+
+
+def pretrain(base_name: str, *, size: str = "l", variant: str = "reference", steps: int = 2000,
+             lora_rank: int = 8, n_blocks: int = 2, batch_size: int = 32, lr: float = 1e-4,
+             out_path: str | Path | None = None, smoke: bool = False,
+             smoke_tiles: int = 64) -> Path:
+    """Continued-SSL pretrain a DINOv3 backbone on unlabeled tiles; write the adapted checkpoint.
+
+    Builds the base backbone, applies the ExPLoRA freeze discipline, and runs the already-tested
+    ``run_ssl`` SimSiam loop over the variant's tiles (labels never read). ``smoke`` runs a few
+    steps on a tiny subset (the U7/U9 fit gate) to confirm the atomic-checkpoint round-trip
+    before the multi-hour run. Returns the checkpoint path.
+    """
+    import sys as _sys
+
+    import torch
+    from torch.utils.data import DataLoader, Subset
+    from torchvision import datasets
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import common as C
+    import features as FEAT
+
+    name = B.dinov3_name(size) if base_name in ("dinov3", "dinov3_ssl") else base_name
+    ext = B.get(name).build()
+    info = freeze_for_ssl(ext.model, n_blocks=n_blocks, lora_rank=lora_rank)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ext.model.to(device).train()
+    out_path = Path(out_path) if out_path else (C.RESULTS_DIR / "ssl" / f"dinov3_{size}_ssl.pt")
+
+    ds = datasets.ImageFolder(FEAT._variant_dir(variant), transform=ext.preprocess)
+    if smoke:
+        steps = min(steps, 5)
+        ds = Subset(ds, list(range(min(len(ds), smoke_tiles))))
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
+
+    def forward_features(x):
+        return ext.forward_features(x)
+
+    class _StateFn:
+        module = ext.model
+
+        def __call__(self):
+            return ext.model.state_dict()
+
+    state_fn = _StateFn()
+    print(f"[ssl] {name}: {info['trainable_params']} trainable params "
+          f"({info['lora_layers']} LoRA layers, {info['unfrozen_blocks']} unfrozen blocks); "
+          f"{'SMOKE ' if smoke else ''}steps={steps} -> {out_path}", flush=True)
+    done = run_ssl(forward_features, _two_views_fn(), loader, in_dim=ext.feature_dim,
+                   steps=steps, out_path=out_path, lr=lr, device=device, state_fn=state_fn)
+    # stamp the lora_rank so load_ssl_backbone rebuilds the matching structure
+    ckpt = load_checkpoint(out_path)
+    save_checkpoint_atomic(ckpt["state"], out_path, {"steps": done, "lora_rank": lora_rank})
+    print(f"[ssl] done: {done} steps -> {out_path}")
+    return out_path
+
+
+def main():
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Continued-SSL pretrain on unlabeled tiles (U7)")
+    ap.add_argument("--size", default="l", choices=list(B.DINOV3_SIZES))
+    ap.add_argument("--variant", default="reference")
+    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--lora-rank", type=int, default=8)
+    ap.add_argument("--n-blocks", type=int, default=2)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--smoke", action="store_true",
+                    help="fit gate: a few steps on a tiny subset, confirm the checkpoint loads")
+    args = ap.parse_args()
+    path = pretrain("dinov3", size=args.size, variant=args.variant, steps=args.steps,
+                    lora_rank=args.lora_rank, n_blocks=args.n_blocks, out_path=args.out,
+                    smoke=args.smoke)
+    # confirm the checkpoint is loadable as a backbone (the round-trip the smoke gates)
+    ext = load_ssl_backbone(B.dinov3_name(args.size), path)
+    print(f"[ssl] checkpoint loads as a backbone: feature_dim={ext.feature_dim}")
+
+
+if __name__ == "__main__":
+    main()

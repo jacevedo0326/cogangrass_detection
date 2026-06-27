@@ -27,6 +27,23 @@ def _target_set(dim=12, n_frames=20, seed=0):
     return samples, np.asarray(feats, np.float32), np.asarray(labels)
 
 
+def test_fewshot_sweep_runs_all_cells_and_lands_in_report(tmp_path):
+    import report as R
+    samples, feats, labels = _target_set()
+    rows = FS.run_fewshot_sweep("dinov2", feats, labels, samples, COG,
+                                adapters=["prototype", "tip"], budgets=[8, 16],
+                                results_dir=tmp_path)
+    assert len(rows) == 4                                     # 2 adapters × 2 budgets
+    assert all(r.eval_setting == C.EVAL_FEWSHOT and r.budget in (8, 16) for r in rows)
+    assert len({r.job_id for r in rows}) == 4                # each cell is a distinct job
+    # they merge into the report's SEPARATE few-shot table, not the cross-collection ranking
+    merged = C.read_all_results(tmp_path)
+    _cross, few, _bad = R.split_rows(merged)
+    assert len(few) == 4 and not _cross
+    report = R.render(merged, bar=0.817)
+    assert "Few-shot target adaptation" in report
+
+
 def test_budget_and_eval_frames_are_disjoint():
     samples, feats, labels = _target_set()
     pool, ev = FS.frame_holdout_split(samples, COG, eval_frac=0.5, seed=1)
