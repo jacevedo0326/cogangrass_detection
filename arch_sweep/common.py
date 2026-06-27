@@ -233,6 +233,83 @@ def pick_threshold_on(y_true_cog: Sequence[int], scores: Sequence[float]) -> flo
     return best_thr
 
 
+def metrics_at_threshold(y_true_cog: Sequence[int], scores: Sequence[float], thr: float) -> dict:
+    """recall / precision / f1 / f2 / fn at one threshold (public wrapper over ``_confusion_at``)."""
+    y = np.asarray(y_true_cog, dtype=int)
+    p = np.asarray(scores, dtype=float)
+    return _confusion_at(y, p, thr)
+
+
+# ---------------------------------------------------------------------------
+# Honest operating threshold + calibration  (U4 — report at the deployed point)
+# ---------------------------------------------------------------------------
+def prior_match_threshold(scores: Sequence[float], prior: float) -> float:
+    """Label-free threshold whose predicted-positive fraction ≈ ``prior`` (known prevalence).
+
+    Reads only ``scores`` and the supplied ``prior`` — **never the target labels** (KTD5
+    honesty). The top ``round(prior*n)`` scored tiles are called positive; the returned
+    threshold sits between the k-th and (k+1)-th largest score so exactly that many clear it.
+    """
+    p = np.sort(np.asarray(scores, dtype=float))[::-1]
+    n = len(p)
+    if n == 0:
+        return 0.5
+    prior = min(max(float(prior), 0.0), 1.0)
+    k = int(round(prior * n))
+    if k <= 0:
+        return float(p[0]) + 1e-9        # predict nothing positive
+    if k >= n:
+        return float(p[-1])              # predict everything positive
+    return float((p[k - 1] + p[k]) / 2.0)
+
+
+def fit_temperature(p_val: Sequence[float], y_val: Sequence[int], *, grid=None) -> float:
+    """Fit a scalar temperature on 0606 val scores to minimize BCE (Platt-style calibration).
+
+    Works in binary-logit space (``logit = log(p/(1-p))``); scaling by ``T`` is **monotonic**,
+    so it preserves the score ranking (AUROC unchanged) and only recalibrates confidence.
+    Fit on the source (0606) scores only — never the target. Returns the best ``T``.
+    """
+    p = np.clip(np.asarray(p_val, dtype=float), 1e-6, 1 - 1e-6)
+    y = np.asarray(y_val, dtype=int)
+    if len(set(y.tolist())) < 2:
+        return 1.0
+    logit = np.log(p / (1 - p))
+    if grid is None:
+        grid = np.linspace(0.05, 10.0, 200)
+    best_T, best_nll = 1.0, np.inf
+    for T in grid:
+        q = np.clip(1.0 / (1.0 + np.exp(-logit / T)), 1e-6, 1 - 1e-6)
+        nll = float(-np.mean(y * np.log(q) + (1 - y) * np.log(1 - q)))
+        if nll < best_nll:
+            best_nll, best_T = nll, float(T)
+    return best_T
+
+
+def apply_temperature(scores: Sequence[float], T: float) -> np.ndarray:
+    """Apply a fitted temperature to probabilities (monotonic recalibration)."""
+    p = np.clip(np.asarray(scores, dtype=float), 1e-6, 1 - 1e-6)
+    logit = np.log(p / (1 - p))
+    return 1.0 / (1.0 + np.exp(-logit / float(T)))
+
+
+def conformal_threshold(cal_scores: Sequence[float], cal_labels: Sequence[int],
+                        target_fnr: float = 0.1) -> float:
+    """Label-DEPENDENT threshold controlling the false-negative rate to ``<= target_fnr``.
+
+    Split-conformal style: with a labeled calibration set, threshold at the ``target_fnr``
+    quantile of the positive scores so at most that fraction of positives fall below it. Uses
+    **target labels**, so any cell using it MUST be tagged ``eval_setting=few_shot`` (KTD5).
+    """
+    p = np.asarray(cal_scores, dtype=float)
+    y = np.asarray(cal_labels, dtype=int)
+    pos = np.sort(p[y == 1])
+    if pos.size == 0:
+        return 0.0
+    k = int(np.floor(min(max(target_fnr, 0.0), 1.0) * pos.size))
+    return float(pos[min(k, pos.size - 1)])
+
+
 # ---------------------------------------------------------------------------
 # Result row  (full cell config + all metrics) and deterministic job identity
 # ---------------------------------------------------------------------------
@@ -275,6 +352,15 @@ class ResultRow:
     threshold: float | None = None             # operating point fit on 0606 (cross) / budget
     val_balanced_accuracy: float | None = None  # best 0606 val bacc (early-stop signal)
     f2_sweep: list = field(default_factory=list)
+
+    # --- honest deployed operating point + calibration (U4; outcome, not identity) ---
+    temperature: float | None = None           # 0606-fit calibration temperature (monotonic)
+    prior: float | None = None                 # known prevalence used for prior-matching
+    threshold_prior: float | None = None       # label-free prior-matched threshold on 0422
+    recall_cog_at_op: float | None = None       # cogongrass recall at the 0606 F2-threshold
+    f2_at_op: float | None = None               # F2 at the 0606 F2-threshold
+    recall_cog_at_prior: float | None = None    # cogongrass recall at the prior-matched threshold
+    f2_at_prior: float | None = None            # F2 at the prior-matched threshold
 
     # --- provenance / budget ---
     n_train: int | None = None

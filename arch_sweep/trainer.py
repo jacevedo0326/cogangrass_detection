@@ -65,6 +65,7 @@ class TrainConfig:
     ft_epochs: int = 8
     ft_patience: int = 3
     augment: bool = False        # domain-randomization + MixStyle on the train path (U7)
+    prior: float | None = None   # known prevalence for the U4 prior-matched threshold (None->0606)
 
     def identity(self) -> dict:
         return {k: getattr(self, k) for k in C.IDENTITY_FIELDS}
@@ -143,16 +144,29 @@ def _balanced_acc_on(head, X, y, idx, cog_idx, device):
 
 
 def _make_ok_row(cfg, *, p_val, y_val, p_te, y_te, val_bacc, n_train, n_val, n_test,
-                 n_trainable, identity_overrides=None) -> C.ResultRow:
+                 n_trainable, identity_overrides=None, prior=None) -> C.ResultRow:
     """Shared scoring tail: 0606-fit threshold + 0422 metrics -> an ok ResultRow.
 
     Used by the frozen, fine-tune (U6), and TTA (U8) paths so every cell is scored
     identically (KTD7). ``identity_overrides`` lets a TTA cell stamp e.g. adaptation=adabn.
+
+    The headline ``balanced_accuracy`` stays the argmax number (comparable to the 0.804/0.817
+    baselines), but the row also carries the deployed-point honesty (U4): cogongrass recall / F2
+    at the 0606-fit F2 threshold and at a **label-free prior-matched** threshold (predicted
+    positive fraction = ``prior``, a known prevalence — never read off the 0422 labels), plus a
+    0606-fit calibration temperature. ``prior`` defaults to the 0606 val prevalence (source data).
     """
-    threshold = C.pick_threshold_on(y_val, p_val) if len(set(y_val)) == 2 else 0.5
+    both_val = len(set(y_val)) == 2
+    threshold = C.pick_threshold_on(y_val, p_val) if both_val else 0.5
     y_pred = [1 if pc >= 0.5 else 0 for pc in p_te]   # argmax — comparable to baselines
     rec = C.per_class_recall(y_te, y_pred)
     both = len(set(y_te)) == 2
+    # U4: honest deployed operating point — recall/F2 at the 0606 threshold and a prior match.
+    prior_val = float(prior) if prior is not None else (float(np.mean(y_val)) if y_val else 0.5)
+    thr_prior = C.prior_match_threshold(p_te, prior_val)
+    op = C.metrics_at_threshold(y_te, p_te, threshold)
+    pri = C.metrics_at_threshold(y_te, p_te, thr_prior)
+    temperature = C.fit_temperature(p_val, y_val) if both_val else 1.0
     identity = {**cfg.identity(), **(identity_overrides or {})}
     return C.ResultRow(
         **identity, status="ok",
@@ -161,6 +175,9 @@ def _make_ok_row(cfg, *, p_val, y_val, p_te, y_te, val_bacc, n_train, n_val, n_t
         auroc=C.auroc(y_te, p_te) if both else None,
         average_precision=C.average_precision(y_te, p_te) if both else None,
         threshold=threshold, val_balanced_accuracy=val_bacc, f2_sweep=C.f2_sweep(y_te, p_te),
+        temperature=temperature, prior=prior_val, threshold_prior=thr_prior,
+        recall_cog_at_op=op["recall"], f2_at_op=op["f2"],
+        recall_cog_at_prior=pri["recall"], f2_at_prior=pri["f2"],
         n_train=n_train, n_val=n_val, n_test=n_test, n_cog_test=int(sum(y_te)),
         trainable_params=n_trainable)
 
@@ -318,7 +335,7 @@ def train_and_eval(cfg: TrainConfig, *, results_dir=C.RESULTS_DIR, samples=None,
         y_te = [1 if int(lab[i]) == cog_idx else 0 for i in te_idx]
         row = _make_ok_row(cfg, p_val=p_val, y_val=y_val, p_te=p_te, y_te=y_te,
                            val_bacc=val_bacc, n_train=len(tr_bal), n_val=len(va_idx),
-                           n_test=len(te_idx), n_trainable=n_trainable)
+                           n_test=len(te_idx), n_trainable=n_trainable, prior=cfg.prior)
         if write_scores:   # U1: persist per-tile P(cog) for every 0422 tile (KTD3)
             te_paths = [samples[i][0] for i in te_idx]
             score_payload = C.build_score_records(te_paths, y_te, p_te)

@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -102,6 +103,44 @@ def test_pick_threshold_is_pure_and_only_uses_given_scores():
     pred = [1 if sc >= thr else 0 for sc in scores_0606]
     assert pred[:3] == [1, 1, 1]   # F2 prioritizes recall -> recover all cogongrass
     assert C.pick_threshold_on(y, scores_0606) == thr   # deterministic, no hidden state
+
+
+# --- honest operating threshold + calibration (U4) ----------------------------
+def test_prior_match_threshold_hits_supplied_fraction_label_free():
+    rng = np.random.RandomState(0)
+    scores = rng.rand(1000)
+    for prior in (0.1, 0.28, 0.5):
+        thr = C.prior_match_threshold(scores, prior)
+        frac = float((scores >= thr).mean())
+        assert abs(frac - prior) < 0.02      # predicted-positive fraction ≈ prior
+    # signature takes only scores + prior — there is no way to pass it the target labels
+    import inspect
+    assert list(inspect.signature(C.prior_match_threshold).parameters) == ["scores", "prior"]
+
+
+def test_temperature_scaling_is_monotonic_preserves_auroc():
+    y = [1, 1, 1, 0, 0, 0]
+    p = [0.9, 0.7, 0.55, 0.45, 0.3, 0.1]
+    T = C.fit_temperature(p, y)
+    q = C.apply_temperature(p, T)
+    # ranking preserved -> AUROC identical; calibration (the actual values) changed
+    assert C.auroc(y, list(q)) == C.auroc(y, p)
+    assert list(q) != p
+    # strictly monotonic in the input order
+    assert all(q[i] >= q[i + 1] for i in range(len(q) - 1))
+
+
+def test_conformal_threshold_controls_fnr_and_is_label_dependent():
+    rng = np.random.RandomState(1)
+    pos = rng.uniform(0.4, 1.0, 200)
+    neg = rng.uniform(0.0, 0.6, 200)
+    scores = np.concatenate([pos, neg])
+    labels = np.concatenate([np.ones(200), np.zeros(200)]).astype(int)
+    thr = C.conformal_threshold(scores, labels, target_fnr=0.1)
+    achieved_fnr = float((pos < thr).mean())
+    assert achieved_fnr <= 0.1 + 1e-9        # at most 10% of positives missed
+    import inspect
+    assert "cal_labels" in inspect.signature(C.conformal_threshold).parameters   # needs labels
 
 
 # --- job identity -------------------------------------------------------------

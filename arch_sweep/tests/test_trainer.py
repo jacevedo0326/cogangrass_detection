@@ -98,6 +98,36 @@ def test_both_head_variants_train(tmp_path):
         assert row.status == "ok" and row.balanced_accuracy is not None
 
 
+# --- U4: deployed operating point + calibration recorded ----------------------
+def test_row_reports_recall_f2_at_deployed_threshold(tmp_path):
+    samples, feats, labels = _synth()
+    row = T.train_and_eval(_cfg(), results_dir=tmp_path, samples=samples,
+                           features=feats, labels=labels, cog_idx=COG_IDX)
+    # the deployed point (0606 F2 threshold) and a label-free prior match are recorded
+    assert row.threshold is not None and row.threshold_prior is not None
+    assert row.recall_cog_at_op is not None and row.f2_at_op is not None
+    assert row.recall_cog_at_prior is not None and row.f2_at_prior is not None
+    assert row.temperature is not None and 0.0 < row.temperature
+    assert row.prior is not None and 0.0 <= row.prior <= 1.0
+    # the 0606 F2 threshold sits below argmax -> recall at the deployed point is no worse
+    assert row.threshold <= 0.5
+    assert row.recall_cog_at_op >= row.recall_cogongrass - 1e-9   # measurable FN drop vs argmax
+
+
+def test_prior_matched_threshold_does_not_read_0422_labels(tmp_path):
+    # corrupting only the 0422 labels must not move the prior-matched threshold (it sees scores
+    # + prior, never the target labels). The prior comes from 0606, so fix it explicitly.
+    samples, feats, labels = _synth()
+    base = T.train_and_eval(_cfg(prior=0.3), results_dir=tmp_path, samples=samples,
+                            features=feats, labels=labels, cog_idx=COG_IDX)
+    labels2 = labels.copy()
+    for i in C.indices_for_date(samples, C.TEST_DATE):
+        labels2[i] = 1 - labels2[i]
+    other = T.train_and_eval(_cfg(prior=0.3, extra="te-flip"), results_dir=tmp_path,
+                             samples=samples, features=feats, labels=labels2, cog_idx=COG_IDX)
+    assert base.threshold_prior == other.threshold_prior
+
+
 # --- threshold honesty: fit on 0606 ONLY --------------------------------------
 def test_operating_threshold_is_independent_of_0422_labels(tmp_path):
     samples, feats, labels = _synth()
