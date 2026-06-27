@@ -95,13 +95,13 @@ def run_detection(tiles, y_true_cog, paths, *, detector=DEFAULT_DETECTOR, n_exem
 # Failure-tolerant detector fit gate  (KTD6)
 # ---------------------------------------------------------------------------
 def load_detector(name: str = DEFAULT_DETECTOR):
-    """Load the visual-exemplar detector. Raises on failure (callers wrap with run_detect_smoke).
+    """Load the visual-exemplar detector (T-Rex2 / T-Rex-Omni). Raises on failure.
 
-    Kept thin and lazy so the heavy import only happens on a real run; the actual loader
-    depends on which detector is settled empirically (open question in the plan).
+    Thin lazy delegate to ``detect.trex.load_trex`` so the heavy SDK import only happens on a
+    real run; callers wrap with ``run_detect_smoke`` so a missing dep is recorded, not crashed.
     """
-    raise NotImplementedError(
-        f"wire the {name} loader at run time (T-Rex2 / T-Rex-Omni or equivalent)")
+    from detect import trex
+    return trex.load_trex(name)
 
 
 def run_detect_smoke(*, detector: str = DEFAULT_DETECTOR, results_dir=C.RESULTS_DIR,

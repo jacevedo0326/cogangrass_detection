@@ -67,8 +67,9 @@ def test_detector_load_failure_records_row_and_does_not_abort(tmp_path):
     assert list(tmp_path.glob("*.jsonl"))                 # row written, program continues
 
 
-def test_default_loader_is_not_silently_a_noop():
-    # the real loader must be wired at run time, not silently succeed
+def test_default_loader_delegates_to_trex_and_fails_clean():
+    # load_detector now delegates to T-Rex2; without the SDK/token it raises a clear error
+    # (recorded by run_detect_smoke), never a silent no-op success.
     import pytest
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(Exception):
         DT.load_detector()
