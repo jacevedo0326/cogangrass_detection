@@ -1,0 +1,15 @@
+{
+  "model": "Qwen/Qwen2-VL-7B-Instruct",
+  "prompt_version": "v1",
+  "split": "0422",
+  "date": "20260422",
+  "coverage": "full",
+  "scored_tiles": 7006,
+  "abstained": 0,
+  "full_split_tiles": 7006,
+  "coverage_frac": 1.0,
+  "class_counts": {
+    "cogongrass": 1993,
+    "not_cogongrass": 5013
+  }
+}

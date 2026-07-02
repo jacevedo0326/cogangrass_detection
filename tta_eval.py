@@ -7,7 +7,6 @@ SOURCE (no adaptation), AdaBN (recompute BatchNorm stats on target), and TENT
 
 Run:  python tta_eval.py [tiles_dataset_clahe] [tile_classifier_da_clahe.pt]
 """
-import re
 import sys
 
 import torch
@@ -16,20 +15,23 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
 from sklearn.metrics import balanced_accuracy_score, classification_report
 
+import tile_common
+
 DATA = sys.argv[1] if len(sys.argv) > 1 else "tiles_dataset_clahe"
 MODEL = sys.argv[2] if len(sys.argv) > 2 else "tile_classifier_da_clahe.pt"
-TEST_DATE, IMG, SEED = "20260422", 224, 42
+HELDOUT, IMG, SEED = tile_common.HELDOUT_DATES, 224, 42
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_tf = transforms.Compose([transforms.Resize(IMG), transforms.CenterCrop(IMG),
                               transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
-frame_of = lambda p: re.match(r"(.+)_r\d+_c\d+$", p.rsplit("\\", 1)[-1].rsplit("/", 1)[-1][:-4]).group(1)
-def date_of(f):
-    m = re.match(r"DJI_(\d{8})", f); return m.group(1) if m else "other"
+# identity comes from the shared contract (plan U2, R1) — Path-based, so the old
+# Windows "\\" path special-casing is gone
+frame_of = tile_common.frame_of
+date_of = tile_common.date_of
 
 
 def test_indices(samples):
-    return [i for i, (p, _) in enumerate(samples) if date_of(frame_of(p)) == TEST_DATE]
+    return [i for i, (p, _) in enumerate(samples) if date_of(frame_of(p)) in HELDOUT]
 
 
 def build(classes):
@@ -61,14 +63,9 @@ def main():
     m = fresh(); m.eval()
     b0, yt, yp = predict(m)
 
-    # --- AdaBN: recompute BN running stats on target inputs ---
+    # --- AdaBN: recompute BN running stats on target inputs (shared impl, R1) ---
     m = fresh(); m.eval()
-    for mod in bn(m):
-        mod.reset_running_stats(); mod.momentum = None; mod.train()   # cumulative stats; dropout stays eval
-    with torch.no_grad():
-        for x, _ in loader:
-            m(x.to(device))
-    m.eval()
+    tile_common.adapt_bn(m, loader, device=device, verbose=False)
     b1, _, _ = predict(m)
 
     # --- TENT: entropy-minimize BN affine (gamma/beta) on target ---
@@ -89,7 +86,7 @@ def main():
             opt.zero_grad(); loss.backward(); opt.step()
     b2, _, _ = predict(m)                   # BN still in batch-stat mode, dropout off, no grad
 
-    print("\n===== held-out 0422 balanced accuracy =====")
+    print(f"\n===== held-out {','.join(HELDOUT)} balanced accuracy =====")
     print(f"  SOURCE (no adaptation) : {b0:.3f}")
     print(f"  AdaBN  (target BN stats): {b1:.3f}")
     print(f"  TENT   (entropy adapt)  : {b2:.3f}")

@@ -7,10 +7,8 @@ tile_train_collection.log - does NOT touch tile_classifier.pt or train_tiles.py.
 
 Run:  python -u train_tiles_collection.py
 """
-import re
 import copy
 import random
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,10 +17,12 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
 from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score
 
+import tile_common
+
 DATA = "tiles_dataset"
 IMG_SIZE, BATCH, MAX_EPOCHS, PATIENCE, LR, SEED = 224, 64, 60, 8, 1e-4, 42
 VAL_FRAC = 0.12
-TEST_DATE = "20260422"        # held-out collection
+HELDOUT = tile_common.HELDOUT_DATES        # held-out collection(s), default ["20260422"]
 OUT_MODEL = "tile_classifier_collection.pt"
 
 random.seed(SEED); torch.manual_seed(SEED)
@@ -36,38 +36,12 @@ train_tf = transforms.Compose([
 eval_tf = transforms.Compose([transforms.Resize(IMG_SIZE), transforms.CenterCrop(IMG_SIZE),
                               transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
 
-frame_of = lambda p: re.match(r"(.+)_r\d+_c\d+$", Path(p).stem).group(1)
-def date_of(frame):
-    m = re.match(r"DJI_(\d{8})", frame)
-    return m.group(1) if m else "other"
-
-
-def split_by_collection(samples, cog_idx):
-    frames = {}
-    for i, (p, lab) in enumerate(samples):
-        f = frame_of(p)
-        d = frames.setdefault(f, {"idx": [], "pos": False, "date": date_of(f)})
-        d["idx"].append(i)
-        if lab == cog_idx:
-            d["pos"] = True
-    test_f = [f for f, d in frames.items() if d["date"] == TEST_DATE]
-    pool = [f for f, d in frames.items() if d["date"] != TEST_DATE]
-    rng = random.Random(SEED)
-    pos = [f for f in pool if frames[f]["pos"]]; neg = [f for f in pool if not frames[f]["pos"]]
-    rng.shuffle(pos); rng.shuffle(neg)
-    nvp, nvn = int(len(pos) * VAL_FRAC), int(len(neg) * VAL_FRAC)
-    val_f = pos[:nvp] + neg[:nvn]; tr_f = pos[nvp:] + neg[nvn:]
-    idx = lambda fl: [i for f in fl for i in frames[f]["idx"]]
-    return idx(tr_f), idx(val_f), idx(test_f), (len(tr_f), len(val_f), len(test_f))
-
-
-def balance(idx, samples, cog_idx, rng):
-    pos = [i for i in idx if samples[i][1] == cog_idx]
-    neg = [i for i in idx if samples[i][1] != cog_idx]
-    if pos and neg:
-        if len(neg) > len(pos): neg = rng.sample(neg, len(pos))
-        elif len(pos) > len(neg): pos = rng.sample(pos, len(neg))
-    out = pos + neg; rng.shuffle(out); return out
+# identity/split/balance now come from the shared contract (plan U2, R1); behavior
+# at the defaults is bit-identical to the private copies these replaced
+frame_of = tile_common.frame_of
+date_of = tile_common.date_of
+split_by_collection = tile_common.split_by_collection
+balance = tile_common.balance
 
 
 def run(model, loader, criterion, optimizer=None, scaler=None):
@@ -94,8 +68,9 @@ def main():
     cog_idx = classes.index("cogongrass")
     print("classes:", classes)
 
-    tr, va, te, (nf_tr, nf_va, nf_te) = split_by_collection(base_eval.samples, cog_idx)
-    print(f"frames -> train(0606) {nf_tr} | val(0606) {nf_va} | TEST(held-out {TEST_DATE}) {nf_te}")
+    tr, va, te, (nf_tr, nf_va, nf_te) = split_by_collection(
+        base_eval.samples, cog_idx, heldout_dates=HELDOUT, seed=SEED, val_frac=VAL_FRAC)
+    print(f"frames -> train {nf_tr} | val {nf_va} | TEST(held-out {','.join(HELDOUT)}) {nf_te}")
     rng = random.Random(SEED)
     tr = balance(tr, base_eval.samples, cog_idx, rng)
     va = balance(va, base_eval.samples, cog_idx, rng)        # test left at natural distribution
@@ -133,7 +108,7 @@ def main():
     model.load_state_dict(best_state)
     print(f"\nin-collection VAL (0606) best balanced accuracy: {best_bacc:.3f}")
     _, te_bacc, yt, yp = run(model, test_loader, criterion)
-    print(f"\n===== HELD-OUT TEST (collection {TEST_DATE}) =====")
+    print(f"\n===== HELD-OUT TEST (collection {','.join(HELDOUT)}) =====")
     print(f"balanced accuracy: {te_bacc:.3f}")
     print(classification_report(yt, yp, target_names=classes, digits=3))
     print("confusion (rows=true, cols=pred):")

@@ -9,10 +9,8 @@ full-res 512px tiles -> 224, our augmentation. Reports SOURCE and AdaBN.
 
 Run:  python -u train_tiles_dino_spatial.py
 """
-import re
 import copy
 import random
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -20,9 +18,11 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 from sklearn.metrics import balanced_accuracy_score, classification_report
 
+import tile_common
+
 DATA = "tiles_dataset"          # 512px no-CLAHE tiles on disk
 IMG, BATCH, MAX_EPOCHS, PATIENCE, LR, SEED = 224, 48, 60, 10, 1e-3, 42
-VAL_FRAC, TEST_DATE = 0.12, "20260422"
+VAL_FRAC, HELDOUT = 0.12, tile_common.HELDOUT_DATES
 OUT_MODEL = "tile_classifier_dino_spatial.pt"
 random.seed(SEED); torch.manual_seed(SEED)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -38,34 +38,11 @@ train_tf = transforms.Compose([
 eval_tf = transforms.Compose([transforms.Resize(IMG), transforms.CenterCrop(IMG),
                               transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
 
-frame_of = lambda p: re.match(r"(.+)_r\d+_c\d+$", Path(p).stem).group(1)
-def date_of(f):
-    m = re.match(r"DJI_(\d{8})", f); return m.group(1) if m else "other"
-
-
-def split_by_collection(samples, cog):
-    fr = {}
-    for i, (p, lab) in enumerate(samples):
-        f = frame_of(p); d = fr.setdefault(f, {"idx": [], "pos": False, "date": date_of(f)})
-        d["idx"].append(i)
-        if lab == cog: d["pos"] = True
-    test = [f for f, d in fr.items() if d["date"] == TEST_DATE]
-    pool = [f for f, d in fr.items() if d["date"] != TEST_DATE]
-    rng = random.Random(SEED)
-    pos = [f for f in pool if fr[f]["pos"]]; neg = [f for f in pool if not fr[f]["pos"]]
-    rng.shuffle(pos); rng.shuffle(neg)
-    nvp, nvn = int(len(pos) * VAL_FRAC), int(len(neg) * VAL_FRAC)
-    val = pos[:nvp] + neg[:nvn]; tr = pos[nvp:] + neg[nvn:]
-    idx = lambda fl: [i for f in fl for i in fr[f]["idx"]]
-    return idx(tr), idx(val), idx(test)
-
-
-def balance(idx, samples, cog, rng):
-    pos = [i for i in idx if samples[i][1] == cog]; neg = [i for i in idx if samples[i][1] != cog]
-    if pos and neg:
-        if len(neg) > len(pos): neg = rng.sample(neg, len(pos))
-        elif len(pos) > len(neg): pos = rng.sample(pos, len(neg))
-    out = pos + neg; rng.shuffle(out); return out
+# identity/split/balance come from the shared contract (plan U2, R1)
+frame_of = tile_common.frame_of
+date_of = tile_common.date_of
+split_by_collection = tile_common.split_by_collection
+balance = tile_common.balance
 
 
 class DinoSpatial(nn.Module):
@@ -120,7 +97,8 @@ def main():
     base_tr = datasets.ImageFolder(DATA, transform=train_tf)
     base_ev = datasets.ImageFolder(DATA, transform=eval_tf)
     classes = base_tr.classes; cog = classes.index("cogongrass")
-    tr, va, te = split_by_collection(base_ev.samples, cog)
+    tr, va, te, _ = split_by_collection(base_ev.samples, cog,
+                                        heldout_dates=HELDOUT, seed=SEED, val_frac=VAL_FRAC)
     rng = random.Random(SEED)
     tr = balance(tr, base_ev.samples, cog, rng); va = balance(va, base_ev.samples, cog, rng)
     print(f"tiles -> train {len(tr)} | val {len(va)} | TEST(0422) {len(te)}")
@@ -152,15 +130,8 @@ def main():
 
     # held-out 0422: SOURCE
     b0, yt, yp = predict(model, el)
-    # held-out 0422: AdaBN (recompute head BN stats on target)
-    for mod in model.modules():
-        if isinstance(mod, nn.BatchNorm2d):
-            mod.reset_running_stats(); mod.momentum = None
-    model.eval()
-    for mod in model.modules():
-        if isinstance(mod, nn.BatchNorm2d): mod.train()
-    with torch.no_grad():
-        for x, _ in el: model(x.to(device))
+    # held-out 0422: AdaBN (recompute head BN stats on target) — shared impl (R1)
+    tile_common.adapt_bn(model, el, device=device, verbose=False)
     b1, _, _ = predict(model, el)
 
     print("\n===== HELD-OUT TEST (0422) =====")

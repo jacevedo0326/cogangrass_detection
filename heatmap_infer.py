@@ -14,11 +14,18 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from torchvision import models, transforms
 from PIL import Image
+
+import tile_common
+
+
+def _plt():
+    """Lazy matplotlib (Agg): tiling/AdaBN helpers stay importable without it."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
 
 MODEL = "tile_classifier_da_noclahe.pt"   # best deployable 512 DA model (CLAHE optional, ~tied)
 TILE, MAX, CNN, VEG, COG_THRESH = 512, 4096, 224, 0.03, 0.5
@@ -40,41 +47,36 @@ def load_model():
 
 
 def tiles_of(path):
-    """Return (tensor_batch, coords, rows, cols, pil_image) for one frame's vegetation tiles."""
+    """Return (tensor_batch, coords, rows, cols, pil_image) for one frame's vegetation tiles.
+
+    Tiling comes from tile_common (plan U2, R5): ceil grid with clamped partial
+    edge crops resized up — training's rule. The legacy floor grid silently
+    dropped partial right/bottom edge tiles.
+    """
     im = Image.open(path).convert("RGB")
     W, H = im.size
     if max(W, H) > MAX:
         s = MAX / max(W, H); im = im.resize((round(W * s), round(H * s))); W, H = im.size
-    arr = np.asarray(im).astype(np.float32); ssum = arr.sum(2) + 1e-6
-    exg = 2 * arr[..., 1] / ssum - arr[..., 0] / ssum - arr[..., 2] / ssum
-    cols, rows = W // TILE, H // TILE
+    exg = tile_common.exg_map(im)
+    cols, rows = tile_common.tile_grid(W, H, TILE)
     ts, coords = [], []
-    for r in range(rows):
-        for c in range(cols):
-            y0, x0 = r * TILE, c * TILE
-            if exg[y0:y0 + TILE, x0:x0 + TILE].mean() < VEG:
-                continue
-            ts.append(to_norm(im.crop((x0, y0, x0 + TILE, y0 + TILE)))); coords.append((r, c))
+    for r, c, box in tile_common.tile_boxes(W, H, TILE):
+        if not tile_common.tile_is_veg(exg, box, VEG):
+            continue
+        ts.append(to_norm(tile_common.cut_tile(im, box, TILE))); coords.append((r, c))
     batch = torch.stack(ts) if ts else torch.empty(0, 3, CNN, CNN)
     return batch, coords, rows, cols, im
 
 
 def adapt_bn(model, paths):
-    """AdaBN: recompute BatchNorm running stats on the target frames' tiles."""
-    for mod in model.modules():
-        if isinstance(mod, nn.BatchNorm2d):
-            mod.reset_running_stats(); mod.momentum = None; mod.train()   # cumulative target stats
-    n = 0
-    with torch.no_grad():
-        for p in paths:
-            b, *_ = tiles_of(p)
-            for i in range(0, len(b), 256):
-                model(b[i:i + 256].to(device)); n += min(256, len(b) - i)
-    model.eval()
+    """AdaBN: recompute BatchNorm running stats on the target frames' tiles (shared impl)."""
+    n = tile_common.adapt_bn(model, (tiles_of(p)[0] for p in paths),
+                             device=device, verbose=False)
     print(f"AdaBN: recomputed BatchNorm stats on {n} target tiles from {len(paths)} frame(s)")
 
 
 def render(path, model, cog_idx):
+    plt = _plt()
     b, coords, rows, cols, im = tiles_of(path)
     if len(b) == 0:
         print(f"{Path(path).name}: no vegetation tiles"); return
@@ -105,6 +107,7 @@ def main(args):
         paths += sorted(p.glob("*.jpg")) + sorted(p.glob("*.JPG")) if p.is_dir() else [p]
     model, cog_idx = load_model()
     print(f"loaded {MODEL} on {device}; {len(paths)} frame(s)")
+    print("note: ceil tiling (edge tiles now scored) — outputs are a new regime vs pre-refactor heatmaps")
     if ADABN:
         adapt_bn(model, paths)          # adapt to this field's frames before predicting
     for p in paths:

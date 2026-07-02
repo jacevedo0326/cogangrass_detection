@@ -18,32 +18,31 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
 
-DATA, MODEL, TEST_DATE, IMG = "tiles_dataset", "tile_classifier_da_noclahe.pt", "20260422", 224
+import tile_common
+
+DATA, MODEL, IMG = "tiles_dataset", "tile_classifier_da_noclahe.pt", 224
+HELDOUT = tile_common.HELDOUT_DATES
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_tf = transforms.Compose([transforms.Resize(IMG), transforms.CenterCrop(IMG),
                               transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
-parse = lambda p: re.match(r"(.+)_r(\d+)_c(\d+)$", Path(p).stem).groups()
+_RC = re.compile(r".*_r(\d+)_c(\d+)$")
+def parse(p):
+    """(frame, row, col) — frame identity via the shared contract (R1)."""
+    m = _RC.match(Path(p).stem)
+    return tile_common.frame_of(p), int(m.group(1)), int(m.group(2))
 
 
 def main():
     base = datasets.ImageFolder(DATA, transform=eval_tf)
     classes = base.classes; cog = classes.index("cogongrass")
-    te = [i for i, (p, _) in enumerate(base.samples) if parse(p)[0][4:12] == TEST_DATE
-          and parse(p)[0].startswith("DJI_")]
+    te = [i for i, (p, _) in enumerate(base.samples)
+          if tile_common.date_of(parse(p)[0]) in HELDOUT]
     loader = DataLoader(Subset(base, te), 64, shuffle=False, num_workers=4)
     m = models.resnet18(weights=None)
     m.fc = nn.Sequential(nn.Dropout(0.4), nn.Linear(m.fc.in_features, len(classes)))
     m.load_state_dict(torch.load(MODEL, map_location=device)["state_dict"]); m = m.to(device)
-    for mod in m.modules():
-        if isinstance(mod, nn.BatchNorm2d):
-            mod.reset_running_stats(); mod.momentum = None
-    m.eval()
-    for mod in m.modules():
-        if isinstance(mod, nn.BatchNorm2d): mod.train()
-    with torch.no_grad():
-        for x, _ in loader: m(x.to(device))
-    m.eval()
+    tile_common.adapt_bn(m, loader, device=device, verbose=False)   # AdaBN (shared impl)
     probs = []
     with torch.no_grad():
         for x, _ in loader:

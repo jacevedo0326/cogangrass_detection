@@ -18,19 +18,51 @@ Controls:
   q                   save & quit
 """
 import json
+import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from matplotlib.widgets import TextBox
+try:                                   # GUI deps are optional: the pure loader
+    import matplotlib.pyplot as plt    # (load_labels) stays importable headless
+    from matplotlib.patches import Rectangle
+    from matplotlib.widgets import TextBox
+except ImportError:
+    plt = Rectangle = TextBox = None
 from PIL import Image
+
+import tile_common
 
 IMG_DIR = Path("drone_dataset/images")
 OUT_DIR = Path("tile_labels")
 SPECIES_FILE = OUT_DIR / "species.json"
-TILE = 160
+# Grid size when a label JSON does not record its own tile_px (full-res default;
+# the per-frame JSON's "tile_px" wins whenever present — plan U2, R3).
+DEFAULT_TILE = int(os.environ.get("TILE_PX", "512"))
 PALETTE = ["lime", "red", "deepskyblue", "yellow", "magenta", "orange",
            "springgreen", "white", "violet", "cyan"]
+
+
+def load_labels(label_path, default_tile: int = None):
+    """Pure loader: ``(tiles, tile_px)`` from a tile-label JSON (GUI-independent).
+
+    ``tiles`` maps ``(row, col) -> species``; ``tile_px`` is the grid size the
+    labels were made on (the JSON's recorded ``tile_px`` when present, else the
+    env/default). Understands both the multi-species ``{"tiles": ...}`` format and
+    the old binary ``{"cogongrass": [...]}`` bootstrap format.
+    """
+    if default_tile is None:
+        default_tile = DEFAULT_TILE
+    label_path = Path(label_path)
+    if not label_path.exists():
+        return {}, default_tile
+    d = json.loads(label_path.read_text())
+    tile = int(d.get("tile_px", default_tile))
+    if "tiles" in d:                      # new multi-species format
+        tiles = {tuple(int(x) for x in k.split(",")): v for k, v in d["tiles"].items()}
+    elif "cogongrass" in d:               # backward-compat: old binary format
+        tiles = {tuple(t): "cogongrass" for t in d["cogongrass"]}
+    else:
+        tiles = {}
+    return tiles, tile
 
 
 def load_species():
@@ -74,16 +106,9 @@ class Labeler:
         img = self.images[self.idx]
         self.im = Image.open(img).convert("RGB")
         self.W, self.H = self.im.size
-        self.cols = -(-self.W // TILE)
-        self.rows = -(-self.H // TILE)
-        self.tiles = {}
-        lp = self.label_path(img)
-        if lp.exists():
-            d = json.loads(lp.read_text())
-            if "tiles" in d:                  # new multi-species format
-                self.tiles = {tuple(int(x) for x in k.split(",")): v for k, v in d["tiles"].items()}
-            elif "cogongrass" in d:           # backward-compat: old binary format
-                self.tiles = {tuple(t): "cogongrass" for t in d["cogongrass"]}
+        # grid follows the label JSON's recorded tile_px when present (R3)
+        self.tiles, self.tile = load_labels(self.label_path(img))
+        self.cols, self.rows = tile_common.tile_grid(self.W, self.H, self.tile)
         for name in set(self.tiles.values()):
             if name not in self.species:
                 self.species.append(name)
@@ -93,12 +118,12 @@ class Labeler:
         self.ax.clear()
         self.ax.imshow(self.im)
         for c in range(self.cols + 1):
-            self.ax.axvline(c * TILE, color="white", lw=0.5, alpha=0.4)
+            self.ax.axvline(c * self.tile, color="white", lw=0.5, alpha=0.4)
         for r in range(self.rows + 1):
-            self.ax.axhline(r * TILE, color="white", lw=0.5, alpha=0.4)
+            self.ax.axhline(r * self.tile, color="white", lw=0.5, alpha=0.4)
         for (r, c), name in self.tiles.items():
             col = self.color(name)
-            self.ax.add_patch(Rectangle((c * TILE, r * TILE), TILE, TILE,
+            self.ax.add_patch(Rectangle((c * self.tile, r * self.tile), self.tile, self.tile,
                                         facecolor=col, alpha=0.40, edgecolor=col, lw=2))
         legend = "   ".join(f"[{i + 1}]{'>' if i == self.active else ' '}{s}"
                             for i, s in enumerate(self.species))
@@ -123,7 +148,7 @@ class Labeler:
     def on_click(self, e):
         if e.inaxes != self.ax or e.xdata is None:
             return
-        c, r = int(e.xdata // TILE), int(e.ydata // TILE)
+        c, r = int(e.xdata // self.tile), int(e.ydata // self.tile)
         if not (0 <= c < self.cols and 0 <= r < self.rows):
             return
         key = (r, c)
@@ -137,9 +162,12 @@ class Labeler:
     def save(self):
         img = self.images[self.idx]
         OUT_DIR.mkdir(exist_ok=True)
+        # writes the CURRENT grid's tile_px back and marks the file human-edited so
+        # boxes_to_tiles.py's bootstrap never clobbers it (R8)
         self.label_path(img).write_text(json.dumps({
-            "image": img.name, "tile_px": TILE, "rows": self.rows, "cols": self.cols,
+            "image": img.name, "tile_px": self.tile, "rows": self.rows, "cols": self.cols,
             "tiles": {f"{r},{c}": n for (r, c), n in sorted(self.tiles.items())},
+            "human_edited": True,
         }))
 
     def on_key(self, e):

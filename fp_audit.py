@@ -16,6 +16,8 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 
+import tile_common
+
 # Full-res pipeline config (CLAUDE.md): tile at 512 on PREP_MAX=4096 frames; the resnet18
 # tile_classifier still takes a 224 crop. Repointed from the legacy 160/1280 (arch_sweep U3).
 TILE, MAX, CNN, VEG, COG = 512, 4096, 224, 0.03, 0.5
@@ -29,6 +31,7 @@ def main():
     classes = ckpt["classes"]; cog = classes.index("cogongrass")
     m = models.resnet18(weights=None); m.fc = nn.Linear(m.fc.in_features, len(classes))
     m.load_state_dict(ckpt["state_dict"]); m.eval().to(device)
+    print("note: ceil tiling (edge tiles now scored) — outputs are a new regime vs pre-refactor audits")
 
     neg = [p.stem for p in Path("drone_dataset/labels").glob("*.txt") if not p.read_text().strip()]
     results, all_fp, all_tiles = [], 0, 0
@@ -39,16 +42,12 @@ def main():
         im = Image.open(ip).convert("RGB"); W, H = im.size
         if max(W, H) > MAX:
             s = MAX / max(W, H); im = im.resize((round(W * s), round(H * s))); W, H = im.size
-        arr = np.asarray(im).astype(np.float32); ss = arr.sum(2) + 1e-6
-        exg = 2 * arr[..., 1] / ss - arr[..., 0] / ss - arr[..., 2] / ss
-        cols, rows = W // TILE, H // TILE
+        exg = tile_common.exg_map(im)
         tiles = []
-        for r in range(rows):
-            for c in range(cols):
-                y0, x0 = r * TILE, c * TILE
-                if exg[y0:y0 + TILE, x0:x0 + TILE].mean() < VEG:
-                    continue
-                tiles.append(norm(im.crop((x0, y0, x0 + TILE, y0 + TILE)).resize((CNN, CNN))))
+        for r, c, box in tile_common.tile_boxes(W, H, TILE):   # ceil grid + clamped edges (R5)
+            if not tile_common.tile_is_veg(exg, box, VEG):
+                continue
+            tiles.append(norm(tile_common.cut_tile(im, box, CNN)))
         if not tiles:
             continue
         with torch.no_grad():

@@ -7,6 +7,13 @@ content signature over the variant's tile paths + the actual feature dim) is sto
 the vectors, so a **stale cache is rejected, not silently reused** — if the underlying tiles
 change, the signature changes and the load raises ``StaleFeatureCache``.
 
+Manifest-aware signatures (plan U2, R6): when the dataset dir carries a
+``_provenance.json`` tiling manifest, its ``tile_common.provenance_hash`` is mixed into
+the signature — so a retile at different params (pixel drift under unchanged filenames)
+invalidates the cache. Datasets WITHOUT a manifest fall back to EXACTLY the legacy
+path-only hash, keeping every pre-manifest cache in results/features/ valid; the cache
+records which era ("legacy" or the manifest hash) produced its signature.
+
 Cheap fit gate (run FIRST on the Spark):
     python arch_sweep/features.py --backbone resnet18 --variant reference --limit 16
 Full extraction for a backbone × variant:
@@ -23,10 +30,12 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # repo root for tile_common
 
 import backbones as B  # noqa: E402
 import common as C  # noqa: E402
 import data_variants as DV  # noqa: E402
+import tile_common  # noqa: E402
 
 FEATURES_DIR = Path(__file__).resolve().parent / "results" / "features"
 
@@ -35,10 +44,37 @@ class StaleFeatureCache(RuntimeError):
     """A cache whose provenance no longer matches the request — must not be reused."""
 
 
-def feature_signature(samples) -> str:
-    """Content signature over the (path, label) list — changes if the tiles change."""
+def dataset_manifest(dataset_dir) -> dict | None:
+    """The dataset dir's tiling-provenance manifest, or None (legacy pre-manifest era)."""
+    if dataset_dir is None:
+        return None
+    path = Path(dataset_dir) / tile_common.PROVENANCE_NAME
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def feature_signature(samples, manifest: dict | None = None) -> str:
+    """Content signature over the (path, label) list — changes if the tiles change.
+
+    With ``manifest`` (the dataset's ``_provenance.json``, plan U2/R6) the signature
+    also mixes in ``tile_common.provenance_hash`` — so a retile at different params
+    changes the signature even under identical filenames, and ``load_features``
+    raises ``StaleFeatureCache`` instead of silently serving stale vectors.
+
+    With ``manifest=None`` the signature is EXACTLY the legacy path-only hash, so
+    every cache built before manifests existed stays valid (legacy fallback).
+    """
     blob = "\n".join(f"{p}\t{lab}" for p, lab in samples)
-    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+    if manifest is None:
+        return hashlib.sha1(blob.encode()).hexdigest()[:16]
+    mhash = tile_common.provenance_hash(manifest)
+    return hashlib.sha1(f"{blob}\n_provenance:{mhash}".encode()).hexdigest()[:16]
+
+
+def signature_era(manifest: dict | None = None) -> str:
+    """Which era produced a signature: "legacy" (no manifest) or the manifest hash."""
+    return "legacy" if manifest is None else tile_common.provenance_hash(manifest)
 
 
 def cache_path(backbone: str, variant: str, cache_dir: Path | str = FEATURES_DIR) -> Path:
@@ -46,12 +82,17 @@ def cache_path(backbone: str, variant: str, cache_dir: Path | str = FEATURES_DIR
 
 
 def save_features(backbone: str, variant: str, features: np.ndarray, labels: np.ndarray,
-                  paths, *, sig: str, cache_dir: Path | str = FEATURES_DIR) -> Path:
-    """Persist features + labels + provenance for a (backbone, variant) cell."""
+                  paths, *, sig: str, era: str = "legacy",
+                  cache_dir: Path | str = FEATURES_DIR) -> Path:
+    """Persist features + labels + provenance for a (backbone, variant) cell.
+
+    ``era`` records which regime produced ``sig``: "legacy" (path-only hash) or the
+    dataset manifest's provenance hash (see ``signature_era``).
+    """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_path(backbone, variant, cache_dir)
-    provenance = {"backbone": backbone, "variant": variant, "sig": sig,
+    provenance = {"backbone": backbone, "variant": variant, "sig": sig, "era": era,
                   "feature_dim": int(features.shape[1]), "n": int(features.shape[0])}
     np.savez(path, features=features.astype(np.float32),
              labels=np.asarray(labels, dtype=np.int64),
@@ -98,12 +139,14 @@ def extract_and_cache(backbone: str, variant: str, *, batch_size: int = 64, limi
     ``samples`` / ``extractor`` / ``load_image`` are injectable so the cache+loop logic is
     testable with a stub (the real backbones are exercised by ``--limit``).
     """
+    manifest = None
     if samples is None:
         data_dir = _variant_dir(variant)
         samples, _classes, _cog = C.enumerate_tiles(data_dir)
+        manifest = dataset_manifest(data_dir)   # None on legacy pre-manifest datasets
     if limit is not None:
         samples = samples[:limit]
-    sig = feature_signature(samples)
+    sig = feature_signature(samples, manifest)
 
     if not overwrite:
         try:
@@ -132,11 +175,13 @@ def extract_and_cache(backbone: str, variant: str, *, batch_size: int = 64, limi
     features = np.concatenate(feats, axis=0)
     labels = np.asarray(labels, dtype=np.int64)
     paths = [p for p, _ in samples]
-    save_features(backbone, variant, features, labels, paths, sig=sig, cache_dir=cache_dir)
+    save_features(backbone, variant, features, labels, paths, sig=sig,
+                  era=signature_era(manifest), cache_dir=cache_dir)
     print(f"[miss->saved] {backbone}×{variant}: features {features.shape} "
           f"(dim {features.shape[1]}) -> {cache_path(backbone, variant, cache_dir)}")
     return {"features": features, "labels": labels, "paths": paths,
             "provenance": {"backbone": backbone, "variant": variant, "sig": sig,
+                           "era": signature_era(manifest),
                            "feature_dim": int(features.shape[1]), "n": len(paths)}}
 
 
